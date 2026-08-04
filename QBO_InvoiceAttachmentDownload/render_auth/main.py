@@ -232,6 +232,7 @@ def get_pending_invoices() -> dict:
         invoice for invoice in invoices
         if invoice.get("PrintStatus") == "NeedToPrint"
         and invoice.get("EmailStatus") == "NotSet"
+        and float(invoice.get("Balance") or 0) > 0
     ]
     return {"count": len(filtered), "invoices": filtered}
 

@@ -236,7 +236,7 @@ class HomePage(Page):
         self._make_action_button(
             action_card,
             column=0,
-            title="Invoice Attachments",
+            title="Invoices",
             description="Download and organize invoice attachments.",
             command=lambda: app.show_page("invoice"),
         )
@@ -1091,7 +1091,7 @@ class InvoiceAttachmentsPage(Page):
         self.grid_rowconfigure(3, weight=1)
 
         ctk.CTkLabel(
-            self, text="Invoice Attachments",
+            self, text="Invoices",
             font=ctk.CTkFont(size=28, weight="bold"), anchor="w",
         ).grid(row=0, column=0, padx=8, pady=(10, 5), sticky="ew")
 
@@ -1183,6 +1183,7 @@ class InvoiceAttachmentsPage(Page):
                 invoice for invoice in raw_invoices
                 if invoice.get("PrintStatus") == "NeedToPrint"
                 and invoice.get("EmailStatus") == "NotSet"
+                and float(invoice.get("Balance") or 0) > 0
             ]
             self.after(0, lambda invoices=filtered: self._load_succeeded(invoices))
         except requests.RequestException as exc:
@@ -1687,7 +1688,7 @@ class QBOExtensionApp(ctk.CTk):
         self.nav_buttons = {}
         nav_items = [
             ("home", "Home"),
-            ("invoice", "Invoice Attachments"),
+            ("invoice", "Invoices"),
             ("settings", "Settings"),
             ("help", "Help"),
         ]
