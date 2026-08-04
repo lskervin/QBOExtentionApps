@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import os
 import secrets
+import time
 from urllib.parse import urlencode
 
 import requests
@@ -21,6 +22,7 @@ REDIRECT_URI = os.environ["QBO_REDIRECT_URI"]
 AUTHORIZATION_URL = "https://appcenter.intuit.com/connect/oauth2"
 TOKEN_URL = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
 QBO_SCOPE = "com.intuit.quickbooks.accounting"
+QBO_API_BASE_URL = "https://quickbooks.api.intuit.com/v3/company"
 
 # Temporary in-memory storage for testing.
 # Replace this with a persistent database before production use.
@@ -169,6 +171,9 @@ def qbo_callback(
         "access_token": token_data["access_token"],
         "refresh_token": token_data["refresh_token"],
         "expires_in": token_data.get("expires_in"),
+        "access_token_expires_at": (
+            time.time() + int(token_data.get("expires_in", 3600)) - 60
+        ),
         "refresh_token_expires_in": token_data.get(
             "x_refresh_token_expires_in"
         ),
@@ -184,6 +189,100 @@ def qbo_callback(
             successful=True,
         )
     )
+
+
+@app.get("/invoices/pending")
+def get_pending_invoices() -> dict:
+    state, session = get_connected_session()
+    access_token = get_valid_access_token(state, session)
+    realm_id = session["realm_id"]
+    invoices = []
+    start_position = 1
+    page_size = 1000
+
+    while True:
+        query = f"SELECT * FROM Invoice STARTPOSITION {start_position} MAXRESULTS {page_size}"
+        response = requests.get(
+            f"{QBO_API_BASE_URL}/{realm_id}/query",
+            headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
+            params={"query": query, "minorversion": "75"},
+            timeout=60,
+        )
+        if response.status_code == 401:
+            access_token = refresh_session_access_token(state, session)
+            response = requests.get(
+                f"{QBO_API_BASE_URL}/{realm_id}/query",
+                headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
+                params={"query": query, "minorversion": "75"},
+                timeout=60,
+            )
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise HTTPException(status_code=502, detail="QuickBooks returned an unreadable invoice response.") from exc
+        if not response.ok:
+            raise HTTPException(status_code=502, detail=f"QuickBooks invoice query failed: {data.get('Fault') or response.reason}")
+        page = data.get("QueryResponse", {}).get("Invoice", [])
+        invoices.extend(page)
+        if len(page) < page_size:
+            break
+        start_position += page_size
+
+    filtered = [
+        invoice for invoice in invoices
+        if invoice.get("PrintStatus") == "NeedToPrint"
+        and invoice.get("EmailStatus") == "NotSet"
+    ]
+    return {"count": len(filtered), "invoices": filtered}
+
+
+def get_connected_session() -> tuple[str, dict]:
+    connected = [
+        (state, session) for state, session in oauth_sessions.items()
+        if session.get("status") == "connected"
+        and session.get("realm_id")
+        and session.get("refresh_token")
+    ]
+    if not connected:
+        raise HTTPException(status_code=401, detail="No QuickBooks company is connected.")
+    return connected[-1]
+
+
+def get_valid_access_token(state: str, session: dict) -> str:
+    if session.get("access_token") and time.time() < float(session.get("access_token_expires_at", 0)):
+        return session["access_token"]
+    return refresh_session_access_token(state, session)
+
+
+def refresh_session_access_token(state: str, session: dict) -> str:
+    refresh_token = session.get("refresh_token")
+    if not refresh_token:
+        raise HTTPException(status_code=401, detail="The QuickBooks refresh token is unavailable.")
+    credentials = f"{CLIENT_ID}:{CLIENT_SECRET}".encode("utf-8")
+    encoded_credentials = base64.b64encode(credentials).decode("ascii")
+    response = requests.post(
+        TOKEN_URL,
+        headers={
+            "Authorization": f"Basic {encoded_credentials}",
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        data={"grant_type": "refresh_token", "refresh_token": refresh_token},
+        timeout=30,
+    )
+    try:
+        token_data = response.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail="Intuit returned an unreadable refresh response.") from exc
+    if not response.ok:
+        description = token_data.get("error_description") or token_data.get("error") or response.reason
+        raise HTTPException(status_code=401, detail=f"QuickBooks authorization refresh failed: {description}")
+    session["access_token"] = token_data["access_token"]
+    session["refresh_token"] = token_data.get("refresh_token", refresh_token)
+    session["expires_in"] = token_data.get("expires_in", 3600)
+    session["access_token_expires_at"] = time.time() + int(token_data.get("expires_in", 3600)) - 60
+    oauth_sessions[state] = session
+    return session["access_token"]
 
 
 def build_authorization_url(state: str) -> str:

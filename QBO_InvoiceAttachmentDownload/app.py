@@ -9,7 +9,7 @@ import requests
 import tkinter as tk
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 from typing import Callable, Optional
 import customtkinter as ctk
 
@@ -1056,6 +1056,206 @@ class DivvyWizardPage(Page):
 
 
 # ============================================================
+# INVOICE ATTACHMENTS PAGE
+# ============================================================
+
+class InvoiceAttachmentsPage(Page):
+    COLUMNS = (
+        "doc_number", "date", "customer", "total", "balance",
+        "print_status", "email_status", "invoice_id",
+    )
+
+    HEADINGS = {
+        "doc_number": "Invoice #",
+        "date": "Date",
+        "customer": "Customer",
+        "total": "Total",
+        "balance": "Balance",
+        "print_status": "Print Status",
+        "email_status": "Email Status",
+        "invoice_id": "QBO ID",
+    }
+
+    WIDTHS = {
+        "doc_number": 95, "date": 95, "customer": 260,
+        "total": 105, "balance": 105, "print_status": 115,
+        "email_status": 105, "invoice_id": 85,
+    }
+
+    def __init__(self, master, app: "QBOExtensionApp"):
+        super().__init__(master, app)
+        self.loading = False
+        self.invoices: list[dict] = []
+
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(3, weight=1)
+
+        ctk.CTkLabel(
+            self, text="Invoice Attachments",
+            font=ctk.CTkFont(size=28, weight="bold"), anchor="w",
+        ).grid(row=0, column=0, padx=8, pady=(10, 5), sticky="ew")
+
+        toolbar = ctk.CTkFrame(self, fg_color="transparent")
+        toolbar.grid(row=1, column=0, padx=8, pady=(0, 12), sticky="ew")
+        toolbar.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            toolbar,
+            text='Invoices where PrintStatus is "NeedToPrint" and EmailStatus is "NotSet".',
+            text_color=("gray35", "gray70"), anchor="w",
+        ).grid(row=0, column=0, sticky="ew")
+
+        self.refresh_button = ctk.CTkButton(
+            toolbar, text="Refresh invoices", width=135, command=self.refresh_invoices,
+        )
+        self.refresh_button.grid(row=0, column=1, padx=(12, 0))
+
+        status_frame = ctk.CTkFrame(self, corner_radius=12)
+        status_frame.grid(row=2, column=0, padx=8, pady=(0, 12), sticky="ew")
+        status_frame.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(status_frame, text="Status:", font=ctk.CTkFont(weight="bold")).grid(
+            row=0, column=0, padx=(16, 8), pady=12, sticky="w"
+        )
+        self.status_label = ctk.CTkLabel(status_frame, text="Ready", anchor="w")
+        self.status_label.grid(row=0, column=1, pady=12, sticky="ew")
+        self.count_label = ctk.CTkLabel(status_frame, text="0 invoices", text_color=("gray35", "gray70"))
+        self.count_label.grid(row=0, column=2, padx=16, pady=12, sticky="e")
+
+        table_card = ctk.CTkFrame(self, corner_radius=14)
+        table_card.grid(row=3, column=0, padx=8, pady=(0, 8), sticky="nsew")
+        table_card.grid_columnconfigure(0, weight=1)
+        table_card.grid_rowconfigure(0, weight=1)
+
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure("Invoice.Treeview", rowheight=32, font=("Segoe UI", 10))
+        style.configure("Invoice.Treeview.Heading", font=("Segoe UI", 10, "bold"))
+
+        self.tree = ttk.Treeview(
+            table_card, columns=self.COLUMNS, show="headings",
+            style="Invoice.Treeview", selectmode="browse",
+        )
+        for column in self.COLUMNS:
+            self.tree.heading(column, text=self.HEADINGS[column], command=lambda col=column: self.sort_by_column(col, False))
+            self.tree.column(
+                column, width=self.WIDTHS[column], minwidth=65,
+                anchor="e" if column in {"total", "balance"} else "w",
+                stretch=column == "customer",
+            )
+
+        vscroll = ttk.Scrollbar(table_card, orient="vertical", command=self.tree.yview)
+        hscroll = ttk.Scrollbar(table_card, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vscroll.set, xscrollcommand=hscroll.set)
+        self.tree.grid(row=0, column=0, sticky="nsew", padx=(12, 0), pady=(12, 0))
+        vscroll.grid(row=0, column=1, sticky="ns", padx=(0, 12), pady=(12, 0))
+        hscroll.grid(row=1, column=0, sticky="ew", padx=(12, 0), pady=(0, 12))
+        self.tree.bind("<Double-1>", self.show_selected_invoice)
+
+    def on_show(self) -> None:
+        if not self.invoices and not self.loading:
+            self.refresh_invoices()
+
+    def refresh_invoices(self) -> None:
+        if self.loading:
+            return
+        if not self.app.settings.qbo_connected:
+            self.status_label.configure(text="Connect QuickBooks in Settings before loading invoices.")
+            messagebox.showwarning(
+                "QuickBooks connection required",
+                "Open Settings → QuickBooks and connect a company first.",
+            )
+            return
+        self.loading = True
+        self.refresh_button.configure(text="Loading...", state="disabled")
+        self.status_label.configure(text="Loading invoices from QuickBooks...")
+        threading.Thread(target=self._load_invoices_worker, daemon=True).start()
+
+    def _load_invoices_worker(self) -> None:
+        try:
+            response = requests.get(f"{RENDER_AUTH_BASE_URL}/invoices/pending", timeout=120)
+            response.raise_for_status()
+            payload = response.json()
+            raw_invoices = payload if isinstance(payload, list) else payload.get("invoices", [])
+            filtered = [
+                invoice for invoice in raw_invoices
+                if invoice.get("PrintStatus") == "NeedToPrint"
+                and invoice.get("EmailStatus") == "NotSet"
+            ]
+            self.after(0, lambda invoices=filtered: self._load_succeeded(invoices))
+        except requests.RequestException as exc:
+            self.after(0, lambda error=exc: self._load_failed(
+                "Could not load invoices from the authentication server.\n\n" + str(error)
+            ))
+        except Exception as exc:
+            self.after(0, lambda error=exc: self._load_failed(str(error)))
+
+    def _load_succeeded(self, invoices: list[dict]) -> None:
+        self.loading = False
+        self.invoices = invoices
+        self.refresh_button.configure(text="Refresh invoices", state="normal")
+        self.status_label.configure(text="Invoice list loaded.")
+        self.count_label.configure(text=f"{len(invoices)} invoice{'' if len(invoices) == 1 else 's'}")
+        self.populate_table(invoices)
+
+    def _load_failed(self, message: str) -> None:
+        self.loading = False
+        self.refresh_button.configure(text="Refresh invoices", state="normal")
+        self.status_label.configure(text="Could not load invoices.")
+        messagebox.showerror("Invoice loading unsuccessful", message)
+
+    def populate_table(self, invoices: list[dict]) -> None:
+        for item_id in self.tree.get_children():
+            self.tree.delete(item_id)
+        for invoice in invoices:
+            customer_ref = invoice.get("CustomerRef") or {}
+            customer_name = customer_ref.get("name") or customer_ref.get("value") or ""
+            self.tree.insert("", "end", values=(
+                invoice.get("DocNumber", ""), invoice.get("TxnDate", ""), customer_name,
+                self.format_money(invoice.get("TotalAmt")),
+                self.format_money(invoice.get("Balance")),
+                invoice.get("PrintStatus", ""), invoice.get("EmailStatus", ""),
+                invoice.get("Id", ""),
+            ))
+
+    @staticmethod
+    def format_money(value) -> str:
+        try:
+            return f"${float(value):,.2f}"
+        except (TypeError, ValueError):
+            return ""
+
+    def sort_by_column(self, column: str, descending: bool) -> None:
+        rows = [(self.tree.set(item_id, column), item_id) for item_id in self.tree.get_children("")]
+        if column in {"total", "balance"}:
+            def key(item):
+                try:
+                    return float(item[0].replace("$", "").replace(",", ""))
+                except ValueError:
+                    return 0.0
+        else:
+            def key(item):
+                return item[0].lower()
+        rows.sort(key=key, reverse=descending)
+        for index, (_, item_id) in enumerate(rows):
+            self.tree.move(item_id, "", index)
+        self.tree.heading(column, command=lambda: self.sort_by_column(column, not descending))
+
+    def show_selected_invoice(self, _event=None) -> None:
+        selection = self.tree.selection()
+        if not selection:
+            return
+        values = self.tree.item(selection[0], "values")
+        messagebox.showinfo(
+            "Selected invoice",
+            f"Invoice: {values[0]}\nDate: {values[1]}\nCustomer: {values[2]}\n"
+            f"Total: {values[3]}\nBalance: {values[4]}\nQBO ID: {values[7]}",
+        )
+
+
+# ============================================================
 # PLACEHOLDER WORKFLOW PAGES
 # ============================================================
 
@@ -1109,30 +1309,227 @@ class WorkflowPlaceholderPage(Page):
 # ============================================================
 
 class SettingsPage(Page):
+    """
+    Settings landing page with two large options:
+
+    • Default Folders opens the folder settings form.
+    • QuickBooks opens the existing QuickBooks connection page.
+    """
+
     def __init__(self, master, app: "QBOExtensionApp"):
         super().__init__(master, app)
+
         self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1)
 
         self.receipt_var = tk.StringVar()
         self.output_var = tk.StringVar()
         self.archive_var = tk.StringVar()
 
-        ctk.CTkLabel(
+        self.title_label = ctk.CTkLabel(
             self,
             text="Settings",
             font=ctk.CTkFont(size=28, weight="bold"),
             anchor="w",
-        ).grid(row=0, column=0, padx=8, pady=(10, 5), sticky="ew")
+        )
+        self.title_label.grid(
+            row=0,
+            column=0,
+            padx=8,
+            pady=(10, 5),
+            sticky="ew",
+        )
 
-        ctk.CTkLabel(
+        self.subtitle_label = ctk.CTkLabel(
             self,
-            text="Set default folders and application preferences.",
+            text="Choose the settings you want to manage.",
             text_color=("gray35", "gray70"),
             anchor="w",
-        ).grid(row=1, column=0, padx=8, pady=(0, 20), sticky="ew")
+        )
+        self.subtitle_label.grid(
+            row=1,
+            column=0,
+            padx=8,
+            pady=(0, 20),
+            sticky="ew",
+        )
 
-        card = SectionCard(self, "Default folders")
-        card.grid(row=2, column=0, padx=8, pady=8, sticky="ew")
+        self.content = ctk.CTkFrame(
+            self,
+            fg_color="transparent",
+        )
+        self.content.grid(
+            row=2,
+            column=0,
+            padx=8,
+            pady=8,
+            sticky="nsew",
+        )
+        self.content.grid_columnconfigure(0, weight=1)
+        self.content.grid_rowconfigure(0, weight=1)
+
+        self.show_settings_menu()
+
+    def clear_content(self) -> None:
+        for widget in self.content.winfo_children():
+            widget.destroy()
+
+    def show_settings_menu(self) -> None:
+        self.clear_content()
+
+        self.title_label.configure(text="Settings")
+        self.subtitle_label.configure(
+            text="Choose the settings you want to manage."
+        )
+
+        menu = ctk.CTkFrame(
+            self.content,
+            fg_color="transparent",
+        )
+        menu.grid(
+            row=0,
+            column=0,
+            padx=12,
+            pady=18,
+            sticky="nsew",
+        )
+        menu.grid_columnconfigure((0, 1), weight=1)
+
+        self._create_settings_tile(
+            master=menu,
+            column=0,
+            icon_text="📁",
+            label="Default Folders",
+            description="Choose the default receipt, output, and archive folders.",
+            command=self.show_default_folders,
+        )
+
+        self._create_settings_tile(
+            master=menu,
+            column=1,
+            icon_text="QB",
+            label="QuickBooks",
+            description="Connect, reconnect, or disconnect QuickBooks Online.",
+            command=lambda: self.app.show_page("connection"),
+        )
+
+    def _create_settings_tile(
+        self,
+        master,
+        column: int,
+        icon_text: str,
+        label: str,
+        description: str,
+        command: Callable[[], None],
+    ) -> None:
+        tile = ctk.CTkFrame(
+            master,
+            corner_radius=16,
+            border_width=1,
+            border_color=("gray75", "gray35"),
+        )
+        tile.grid(
+            row=0,
+            column=column,
+            padx=12,
+            pady=12,
+            sticky="nsew",
+        )
+        tile.grid_columnconfigure(0, weight=1)
+
+        icon_button = ctk.CTkButton(
+            tile,
+            text=icon_text,
+            width=112,
+            height=112,
+            corner_radius=22,
+            font=ctk.CTkFont(
+                size=42 if icon_text != "QB" else 34,
+                weight="bold",
+            ),
+            command=command,
+        )
+        icon_button.grid(
+            row=0,
+            column=0,
+            padx=30,
+            pady=(30, 14),
+        )
+
+        label_button = ctk.CTkButton(
+            tile,
+            text=label,
+            fg_color="transparent",
+            hover_color=("gray85", "gray25"),
+            text_color=("gray10", "gray95"),
+            font=ctk.CTkFont(size=18, weight="bold"),
+            command=command,
+        )
+        label_button.grid(
+            row=1,
+            column=0,
+            padx=20,
+            pady=(0, 8),
+        )
+
+        ctk.CTkLabel(
+            tile,
+            text=description,
+            wraplength=280,
+            justify="center",
+            text_color=("gray35", "gray70"),
+        ).grid(
+            row=2,
+            column=0,
+            padx=24,
+            pady=(0, 30),
+        )
+
+    def show_default_folders(self) -> None:
+        self.clear_content()
+
+        self.title_label.configure(text="Default Folders")
+        self.subtitle_label.configure(
+            text="Set the folders the application should use automatically."
+        )
+
+        wrapper = ctk.CTkFrame(
+            self.content,
+            fg_color="transparent",
+        )
+        wrapper.grid(
+            row=0,
+            column=0,
+            sticky="nsew",
+        )
+        wrapper.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkButton(
+            wrapper,
+            text="← Back to Settings",
+            width=150,
+            height=36,
+            fg_color="transparent",
+            border_width=1,
+            text_color=("gray15", "gray90"),
+            command=self.show_settings_menu,
+        ).grid(
+            row=0,
+            column=0,
+            pady=(0, 14),
+            sticky="w",
+        )
+
+        card = SectionCard(
+            wrapper,
+            "Default folders",
+            "These folders will be preselected when you start a workflow.",
+        )
+        card.grid(
+            row=1,
+            column=0,
+            sticky="ew",
+        )
         card.grid_columnconfigure(0, weight=1)
 
         PathSelector(
@@ -1140,28 +1537,52 @@ class SettingsPage(Page):
             "Receipt folder",
             self.receipt_var,
             lambda: self.pick_folder(self.receipt_var),
-        ).grid(row=2, column=0, padx=22, pady=(8, 16), sticky="ew")
+        ).grid(
+            row=2,
+            column=0,
+            padx=22,
+            pady=(8, 16),
+            sticky="ew",
+        )
 
         PathSelector(
             card,
             "Output folder",
             self.output_var,
             lambda: self.pick_folder(self.output_var),
-        ).grid(row=3, column=0, padx=22, pady=(0, 16), sticky="ew")
+        ).grid(
+            row=3,
+            column=0,
+            padx=22,
+            pady=(0, 16),
+            sticky="ew",
+        )
 
         PathSelector(
             card,
             "Archive folder",
             self.archive_var,
             lambda: self.pick_folder(self.archive_var),
-        ).grid(row=4, column=0, padx=22, pady=(0, 16), sticky="ew")
+        ).grid(
+            row=4,
+            column=0,
+            padx=22,
+            pady=(0, 16),
+            sticky="ew",
+        )
 
         ctk.CTkButton(
             card,
             text="Save settings",
             height=40,
             command=self.save,
-        ).grid(row=5, column=0, padx=22, pady=(0, 22), sticky="e")
+        ).grid(
+            row=5,
+            column=0,
+            padx=22,
+            pady=(0, 22),
+            sticky="e",
+        )
 
     @staticmethod
     def pick_folder(variable: tk.StringVar) -> None:
@@ -1174,13 +1595,18 @@ class SettingsPage(Page):
         self.app.settings.output_folder = self.output_var.get().strip()
         self.app.settings.archive_folder = self.archive_var.get().strip()
         self.app.save_settings()
-        messagebox.showinfo("Settings saved", "Your settings have been saved.")
+
+        messagebox.showinfo(
+            "Settings saved",
+            "Your default folders have been saved.",
+        )
 
     def on_show(self) -> None:
         settings = self.app.settings
         self.receipt_var.set(settings.receipt_folder)
         self.output_var.set(settings.output_folder)
         self.archive_var.set(settings.archive_folder)
+        self.show_settings_menu()
 
 
 # ============================================================
@@ -1261,7 +1687,6 @@ class QBOExtensionApp(ctk.CTk):
         self.nav_buttons = {}
         nav_items = [
             ("home", "Home"),
-            ("connection", "QuickBooks"),
             ("invoice", "Invoice Attachments"),
             ("settings", "Settings"),
             ("help", "Help"),
@@ -1298,11 +1723,9 @@ class QBOExtensionApp(ctk.CTk):
         self.pages = {
             "home": HomePage(self.main_container, self),
             "connection": ConnectionPage(self.main_container, self),
-            "invoice": WorkflowPlaceholderPage(
+            "invoice": InvoiceAttachmentsPage(
                 self.main_container,
                 self,
-                "Invoice attachments",
-                "Download, rename, and organize invoice attachments.",
             ),
             "settings": SettingsPage(self.main_container, self),
             "help": HelpPage(self.main_container, self),
@@ -1329,8 +1752,16 @@ class QBOExtensionApp(ctk.CTk):
         page.on_show()
         self.current_page = page_key
 
+        # The QuickBooks connection page is accessed from Settings,
+        # so keep Settings highlighted while that page is open.
+        active_nav_key = (
+            "settings"
+            if page_key == "connection"
+            else page_key
+        )
+
         for key, button in self.nav_buttons.items():
-            if key == page_key:
+            if key == active_nav_key:
                 button.configure(
                     fg_color=("gray75", "gray30"),
                     text_color=("gray10", "gray95"),
