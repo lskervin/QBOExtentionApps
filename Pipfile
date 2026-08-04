@@ -10,9 +10,9 @@ pytesseract = "*"
 openpyxl = "*"
 intuit-oauth = "*"
 customtkinter = "*"
-requests = "*"
 python-dotenv = "*"
 keyring = "*"
+requests = "*"
 
 [dev-packages]
 

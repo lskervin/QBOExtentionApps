@@ -1,11 +1,11 @@
 from __future__ import annotations
-from qbo_auth import QBOAuthError, QBOAuthManager
-
 import json
 import os
 import queue
 import threading
 import time
+import webbrowser
+import requests
 import tkinter as tk
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -21,6 +21,10 @@ import customtkinter as ctk
 APP_NAME = "QBO Extension Apps"
 APP_VERSION = "1.0.0"
 WINDOW_SIZE = "1180x760"
+
+RENDER_AUTH_BASE_URL = (
+    "https://qbo-extension-auth.onrender.com"
+)
 
 ctk.set_appearance_mode("system")
 ctk.set_default_color_theme("blue")
@@ -291,9 +295,13 @@ class HomePage(Page):
 # ============================================================
 
 class ConnectionPage(Page):
+    POLL_INTERVAL_SECONDS = 2
+    CONNECTION_TIMEOUT_SECONDS = 300
+
     def __init__(self, master, app: "QBOExtensionApp"):
         super().__init__(master, app)
         self.grid_columnconfigure(0, weight=1)
+        self.connection_in_progress = False
 
         ctk.CTkLabel(
             self,
@@ -312,7 +320,7 @@ class ConnectionPage(Page):
         card = SectionCard(
             self,
             "Connection status",
-            "Your QuickBooks password is never stored in this application.",
+            "Authentication is completed securely through the hosted Render service.",
         )
         card.grid(row=2, column=0, padx=8, pady=8, sticky="ew")
         card.grid_columnconfigure(0, weight=1)
@@ -330,6 +338,8 @@ class ConnectionPage(Page):
             text="",
             text_color=("gray35", "gray70"),
             anchor="w",
+            justify="left",
+            wraplength=760,
         )
         self.company_label.grid(row=3, column=0, padx=22, pady=(0, 14), sticky="ew")
 
@@ -359,110 +369,226 @@ class ConnectionPage(Page):
         note.grid(row=3, column=0, padx=8, pady=(18, 8), sticky="ew")
         note.insert(
             "1.0",
-            "Developer integration note\n\n"
-            "Replace ConnectionPage.connect_qbo() with your OAuth 2.0 flow. "
-            "After authorization, set app.settings.qbo_connected to True, "
-            "save the selected company name, and securely store OAuth tokens "
-            "using Windows Credential Manager or another encrypted store.\n\n"
-            "Do not save access tokens or client secrets in Git.",
+            "How connection works\n\n"
+            "1. The app requests a temporary login session from Render.\n"
+            "2. Your browser opens the Intuit authorization page.\n"
+            "3. After approval, Intuit returns to the Render callback.\n"
+            "4. This app checks Render until the connection is complete.\n\n"
+            "Your Intuit client secret is not stored in this desktop application.",
         )
         note.configure(state="disabled")
 
     def connect_qbo(self) -> None:
+        if self.connection_in_progress:
+            return
+
+        self.connection_in_progress = True
         self.connect_button.configure(
-            text="Waiting for QuickBooks...",
+            text="Opening QuickBooks...",
             state="disabled",
         )
-
-        def worker() -> None:
-            try:
-                manager = QBOAuthManager()
-                connection = manager.connect()
-
-                self.after(
-                    0,
-                    lambda: self._connection_succeeded(
-                        connection.realm_id
-                    ),
-                )
-
-            except Exception as exc:
-                self.after(
-                    0,
-                    lambda error=exc: self._connection_failed(error),
-                )
+        self.disconnect_button.configure(state="disabled")
+        self.status_label.configure(text="Starting connection")
+        self.company_label.configure(
+            text="Contacting the authentication service..."
+        )
 
         threading.Thread(
-            target=worker,
+            target=self._run_qbo_connection,
             daemon=True,
         ).start()
 
-    def _connection_succeeded(self, realm_id: str) -> None:
-        self.app.settings.qbo_connected = True
+    def _run_qbo_connection(self) -> None:
+        try:
+            response = requests.post(
+                f"{RENDER_AUTH_BASE_URL}/connect-session",
+                timeout=60,
+            )
+            response.raise_for_status()
 
-        # We will replace this with the actual QBO company name next.
-        self.app.settings.qbo_company_name = (
-            f"QuickBooks Company {realm_id}"
+            try:
+                connection_data = response.json()
+            except ValueError as exc:
+                raise RuntimeError(
+                    "The authentication server returned an unreadable response."
+                ) from exc
+
+            session_id = connection_data.get("session_id")
+            authorization_url = connection_data.get("authorization_url")
+
+            if not session_id or not authorization_url:
+                raise RuntimeError(
+                    "The authentication server did not return a login session."
+                )
+
+            browser_opened = webbrowser.open(authorization_url)
+            if not browser_opened:
+                raise RuntimeError(
+                    "The QuickBooks login page could not be opened automatically."
+                )
+
+            self.after(0, self._show_waiting_for_browser)
+            self._wait_for_qbo_connection(session_id)
+
+        except requests.RequestException as exc:
+            self.after(
+                0,
+                lambda error=exc: self._connection_failed(
+                    "Could not contact the authentication server.\n\n"
+                    f"{error}"
+                ),
+            )
+        except Exception as exc:
+            self.after(
+                0,
+                lambda error=exc: self._connection_failed(str(error)),
+            )
+
+    def _show_waiting_for_browser(self) -> None:
+        self.status_label.configure(text="Waiting for QuickBooks authorization")
+        self.company_label.configure(
+            text=(
+                "Complete the login and company selection in your browser. "
+                "This window will update automatically."
+            )
+        )
+        self.connect_button.configure(text="Waiting for approval...")
+
+    def _wait_for_qbo_connection(self, session_id: str) -> None:
+        deadline = time.time() + self.CONNECTION_TIMEOUT_SECONDS
+        last_network_error: str | None = None
+
+        while time.time() < deadline:
+            try:
+                response = requests.get(
+                    f"{RENDER_AUTH_BASE_URL}/connect-status/{session_id}",
+                    timeout=30,
+                )
+
+                if response.status_code == 404:
+                    time.sleep(self.POLL_INTERVAL_SECONDS)
+                    continue
+
+                response.raise_for_status()
+
+                try:
+                    status_data = response.json()
+                except ValueError as exc:
+                    raise RuntimeError(
+                        "The authentication server returned an unreadable status response."
+                    ) from exc
+
+                if status_data.get("connected"):
+                    realm_id = status_data.get("realm_id")
+                    company_name = status_data.get("company_name")
+
+                    if not realm_id:
+                        raise RuntimeError(
+                            "QuickBooks connected, but no company ID was returned."
+                        )
+
+                    self.after(
+                        0,
+                        lambda value=realm_id, name=company_name:
+                        self._connection_succeeded(value, name),
+                    )
+                    return
+
+                status = str(status_data.get("status", "waiting")).lower()
+                if status in {"failed", "error", "denied"}:
+                    raise RuntimeError(
+                        status_data.get("message")
+                        or "QuickBooks authorization was not completed."
+                    )
+
+                last_network_error = None
+
+            except requests.RequestException as exc:
+                last_network_error = str(exc)
+
+            time.sleep(self.POLL_INTERVAL_SECONDS)
+
+        timeout_message = "The QuickBooks login timed out. Please try again."
+        if last_network_error:
+            timeout_message += f"\n\nLast server error: {last_network_error}"
+
+        self.after(
+            0,
+            lambda message=timeout_message: self._connection_failed(message),
         )
 
+    def _connection_succeeded(
+        self,
+        realm_id: str,
+        company_name: str | None = None,
+    ) -> None:
+        self.connection_in_progress = False
+        self.app.settings.qbo_connected = True
+        self.app.settings.qbo_company_name = (
+            company_name or f"QuickBooks Company {realm_id}"
+        )
         self.app.save_settings()
         self.refresh()
 
         messagebox.showinfo(
             "QuickBooks connected",
-            "Your QuickBooks company is now connected.",
+            "Your QuickBooks company was connected successfully.",
         )
 
-
-        def _connection_failed(self, error: Exception) -> None:
-            self.refresh()
-
-            messagebox.showerror(
-                "Connection unsuccessful",
-                str(error),
-            )
+    def _connection_failed(self, message: str) -> None:
+        self.connection_in_progress = False
+        self.refresh()
+        messagebox.showerror(
+            "QuickBooks connection unsuccessful",
+            message,
+        )
 
     def disconnect_qbo(self) -> None:
+        if self.connection_in_progress:
+            return
+
         if not self.app.settings.qbo_connected:
             return
 
         confirmed = messagebox.askyesno(
             "Disconnect QuickBooks",
-            "Disconnect the current QuickBooks company?",
+            "Remove this QuickBooks connection from the desktop app?",
         )
-
         if not confirmed:
             return
 
-        try:
-            manager = QBOAuthManager()
-            manager.disconnect()
-
-            self.app.settings.qbo_connected = False
-            self.app.settings.qbo_company_name = ""
-            self.app.save_settings()
-            self.refresh()
-
-        except Exception as exc:
-            messagebox.showerror(
-                "Could not disconnect",
-                str(exc),
-            )
+        # This currently clears only the desktop app's saved connection state.
+        # Add a protected Render disconnect endpoint later to revoke and delete
+        # the stored QBO refresh token on the server.
+        self.app.settings.qbo_connected = False
+        self.app.settings.qbo_company_name = ""
+        self.app.save_settings()
+        self.refresh()
 
     def refresh(self) -> None:
         settings = self.app.settings
+
+        if self.connection_in_progress:
+            self.connect_button.configure(state="disabled")
+            self.disconnect_button.configure(state="disabled")
+            return
 
         if settings.qbo_connected:
             self.status_label.configure(text="Connected")
             self.company_label.configure(
                 text=f"Company: {settings.qbo_company_name or 'QuickBooks Online'}"
             )
-            self.connect_button.configure(text="Reconnect")
+            self.connect_button.configure(text="Reconnect", state="normal")
             self.disconnect_button.configure(state="normal")
         else:
             self.status_label.configure(text="Not connected")
-            self.company_label.configure(text="Connect to begin using QBO workflows.")
-            self.connect_button.configure(text="Connect to QuickBooks")
+            self.company_label.configure(
+                text="Connect to begin using QBO workflows."
+            )
+            self.connect_button.configure(
+                text="Connect to QuickBooks",
+                state="normal",
+            )
             self.disconnect_button.configure(state="disabled")
 
     def on_show(self) -> None:
