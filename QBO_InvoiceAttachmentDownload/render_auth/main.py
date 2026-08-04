@@ -1,5 +1,6 @@
 from __future__ import annotations
-
+from pydantic import BaseModel
+from fastapi.responses import HTMLResponse, RedirectResponse
 import base64
 import os
 import secrets
@@ -39,15 +40,17 @@ def health() -> dict[str, str]:
     return {"status": "healthy"}
 
 
-@app.get("/connect")
-def connect() -> RedirectResponse:
+@app.post("/connect-session", response_model=ConnectSessionResponse)
+def create_connect_session() -> ConnectSessionResponse:
     """
-    Creates an OAuth session and sends the user to Intuit.
+    Creates a login session for the desktop application.
     """
 
+    session_id = secrets.token_urlsafe(32)
     state = secrets.token_urlsafe(32)
 
     oauth_sessions[state] = {
+        "session_id": session_id,
         "status": "waiting",
     }
 
@@ -64,7 +67,10 @@ def connect() -> RedirectResponse:
         f"{urlencode(authorization_parameters)}"
     )
 
-    return RedirectResponse(authorization_url)
+    return ConnectSessionResponse(
+        session_id=session_id,
+        authorization_url=authorization_url,
+    )
 
 
 @app.get("/qbo/callback", response_class=HTMLResponse)
@@ -102,9 +108,27 @@ def qbo_callback(
             detail="Missing authorization code or company ID.",
         )
 
+@app.get("/connect-status/{session_id}")
+def connect_status(session_id: str) -> dict:
+    for session in oauth_sessions.values():
+        if session.get("session_id") == session_id:
+            return {
+                "status": session.get("status", "waiting"),
+                "connected": session.get("status") == "connected",
+                "realm_id": session.get("realm_id"),
+            }
+
+    raise HTTPException(
+        status_code=404,
+        detail="Connection session was not found or expired.",
+    )
+
     token_data = exchange_code_for_tokens(code)
 
+    existing_session = oauth_sessions[state]
+
     oauth_sessions[state] = {
+        "session_id": existing_session.get("session_id"),
         "status": "connected",
         "realm_id": realmId,
         "access_token": token_data["access_token"],
@@ -126,6 +150,9 @@ def qbo_callback(
         )
     )
 
+class ConnectSessionResponse(BaseModel):
+    session_id: str
+    authorization_url: str
 
 def exchange_code_for_tokens(code: str) -> dict:
     credentials = f"{CLIENT_ID}:{CLIENT_SECRET}".encode("utf-8")
