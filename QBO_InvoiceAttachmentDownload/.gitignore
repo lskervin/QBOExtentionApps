@@ -1,0 +1,10 @@
+.vscode/
+DivvyReceiptsUploadDev/
+QBO.env
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.log
+.DS_Store
+Thumbs.db

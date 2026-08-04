@@ -4,8 +4,15 @@ verify_ssl = true
 name = "pypi"
 
 [packages]
+pillow = "*"
 pdfplumber = "*"
+pytesseract = "*"
+openpyxl = "*"
+intuit-oauth = "*"
+customtkinter = "*"
 requests = "*"
+python-dotenv = "*"
+keyring = "*"
 
 [dev-packages]
 
