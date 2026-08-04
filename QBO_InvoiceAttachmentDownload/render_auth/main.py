@@ -1,14 +1,14 @@
 from __future__ import annotations
-from pydantic import BaseModel
-from fastapi.responses import HTMLResponse, RedirectResponse
+
 import base64
 import os
 import secrets
 from urllib.parse import urlencode
 
 import requests
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse
+from pydantic import BaseModel
 
 
 app = FastAPI(title="QBO Extension Apps Auth Server")
@@ -22,9 +22,14 @@ AUTHORIZATION_URL = "https://appcenter.intuit.com/connect/oauth2"
 TOKEN_URL = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
 QBO_SCOPE = "com.intuit.quickbooks.accounting"
 
-# Temporary storage for the first test.
-# This will be replaced with a database before real production use.
+# Temporary in-memory storage for testing.
+# Replace this with a persistent database before production use.
 oauth_sessions: dict[str, dict] = {}
+
+
+class ConnectSessionResponse(BaseModel):
+    session_id: str
+    authorization_url: str
 
 
 @app.get("/")
@@ -40,12 +45,28 @@ def health() -> dict[str, str]:
     return {"status": "healthy"}
 
 
+@app.get("/connect")
+def connect() -> RedirectResponse:
+    """
+    Browser-only test route.
+    Starts OAuth without creating a desktop polling session.
+    """
+    state = secrets.token_urlsafe(32)
+
+    oauth_sessions[state] = {
+        "session_id": None,
+        "status": "waiting",
+    }
+
+    authorization_url = build_authorization_url(state)
+    return RedirectResponse(url=authorization_url)
+
+
 @app.post("/connect-session", response_model=ConnectSessionResponse)
 def create_connect_session() -> ConnectSessionResponse:
     """
-    Creates a login session for the desktop application.
+    Creates an OAuth login session for the desktop application.
     """
-
     session_id = secrets.token_urlsafe(32)
     state = secrets.token_urlsafe(32)
 
@@ -54,28 +75,34 @@ def create_connect_session() -> ConnectSessionResponse:
         "status": "waiting",
     }
 
-    authorization_parameters = {
-        "client_id": CLIENT_ID,
-        "response_type": "code",
-        "scope": QBO_SCOPE,
-        "redirect_uri": REDIRECT_URI,
-        "state": state,
-    }
-
-    authorization_url = (
-        f"{AUTHORIZATION_URL}?"
-        f"{urlencode(authorization_parameters)}"
-    )
-
     return ConnectSessionResponse(
         session_id=session_id,
-        authorization_url=authorization_url,
+        authorization_url=build_authorization_url(state),
+    )
+
+
+@app.get("/connect-status/{session_id}")
+def connect_status(session_id: str) -> dict:
+    """
+    Allows the desktop application to check whether OAuth completed.
+    """
+    for session in oauth_sessions.values():
+        if session.get("session_id") == session_id:
+            return {
+                "status": session.get("status", "waiting"),
+                "connected": session.get("status") == "connected",
+                "realm_id": session.get("realm_id"),
+                "message": session.get("message"),
+            }
+
+    raise HTTPException(
+        status_code=404,
+        detail="Connection session was not found or expired.",
     )
 
 
 @app.get("/qbo/callback", response_class=HTMLResponse)
 def qbo_callback(
-    request: Request,
     code: str | None = None,
     realmId: str | None = None,
     state: str | None = None,
@@ -83,10 +110,25 @@ def qbo_callback(
     error_description: str | None = None,
 ) -> HTMLResponse:
     """
-    Intuit sends the browser to this route after authorization.
+    Receives Intuit's OAuth callback, exchanges the authorization code
+    for tokens, and marks the desktop session as connected.
     """
+    if not state or state not in oauth_sessions:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid or expired OAuth state.",
+        )
+
+    existing_session = oauth_sessions[state]
 
     if error:
+        existing_session.update(
+            {
+                "status": "failed",
+                "message": error_description or error,
+            }
+        )
+
         return HTMLResponse(
             content=build_result_page(
                 heading="Connection unsuccessful",
@@ -96,36 +138,29 @@ def qbo_callback(
             status_code=400,
         )
 
-    if not state or state not in oauth_sessions:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid or expired OAuth state.",
+    if not code or not realmId:
+        existing_session.update(
+            {
+                "status": "failed",
+                "message": "Missing authorization code or company ID.",
+            }
         )
 
-    if not code or not realmId:
         raise HTTPException(
             status_code=400,
             detail="Missing authorization code or company ID.",
         )
 
-@app.get("/connect-status/{session_id}")
-def connect_status(session_id: str) -> dict:
-    for session in oauth_sessions.values():
-        if session.get("session_id") == session_id:
-            return {
-                "status": session.get("status", "waiting"),
-                "connected": session.get("status") == "connected",
-                "realm_id": session.get("realm_id"),
+    try:
+        token_data = exchange_code_for_tokens(code)
+    except HTTPException as exc:
+        existing_session.update(
+            {
+                "status": "failed",
+                "message": str(exc.detail),
             }
-
-    raise HTTPException(
-        status_code=404,
-        detail="Connection session was not found or expired.",
-    )
-
-    token_data = exchange_code_for_tokens(code)
-
-    existing_session = oauth_sessions[state]
+        )
+        raise
 
     oauth_sessions[state] = {
         "session_id": existing_session.get("session_id"),
@@ -144,34 +179,52 @@ def connect_status(session_id: str) -> dict:
             heading="QuickBooks connected",
             message=(
                 "Your QuickBooks company was connected successfully. "
-                "You can close this browser window."
+                "You can close this browser window and return to the desktop app."
             ),
             successful=True,
         )
     )
 
-class ConnectSessionResponse(BaseModel):
-    session_id: str
-    authorization_url: str
+
+def build_authorization_url(state: str) -> str:
+    authorization_parameters = {
+        "client_id": CLIENT_ID,
+        "response_type": "code",
+        "scope": QBO_SCOPE,
+        "redirect_uri": REDIRECT_URI,
+        "state": state,
+    }
+
+    return (
+        f"{AUTHORIZATION_URL}?"
+        f"{urlencode(authorization_parameters)}"
+    )
+
 
 def exchange_code_for_tokens(code: str) -> dict:
     credentials = f"{CLIENT_ID}:{CLIENT_SECRET}".encode("utf-8")
     encoded_credentials = base64.b64encode(credentials).decode("ascii")
 
-    response = requests.post(
-        TOKEN_URL,
-        headers={
-            "Authorization": f"Basic {encoded_credentials}",
-            "Accept": "application/json",
-            "Content-Type": "application/x-www-form-urlencoded",
-        },
-        data={
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": REDIRECT_URI,
-        },
-        timeout=30,
-    )
+    try:
+        response = requests.post(
+            TOKEN_URL,
+            headers={
+                "Authorization": f"Basic {encoded_credentials}",
+                "Accept": "application/json",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": REDIRECT_URI,
+            },
+            timeout=30,
+        )
+    except requests.RequestException as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not contact Intuit's token service: {exc}",
+        ) from exc
 
     try:
         data = response.json()
@@ -193,6 +246,12 @@ def exchange_code_for_tokens(code: str) -> dict:
             detail=f"Token exchange failed: {description}",
         )
 
+    if "access_token" not in data or "refresh_token" not in data:
+        raise HTTPException(
+            status_code=502,
+            detail="Intuit's token response was missing required tokens.",
+        )
+
     return data
 
 
@@ -202,6 +261,7 @@ def build_result_page(
     successful: bool,
 ) -> str:
     symbol = "✓" if successful else "×"
+    symbol_background = "#e8f5e9" if successful else "#fdecec"
 
     return f"""
     <!doctype html>
@@ -243,7 +303,7 @@ def build_result_page(
                     display: flex;
                     justify-content: center;
                     align-items: center;
-                    background: #e8f5e9;
+                    background: {symbol_background};
                     font-size: 38px;
                     font-weight: bold;
                 }}
