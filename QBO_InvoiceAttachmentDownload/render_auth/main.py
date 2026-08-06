@@ -276,6 +276,58 @@ def get_invoice_detail(invoice_id: str) -> dict:
     }
 
 
+
+@app.get("/attachments/{attachable_id}/download")
+def download_attachment(attachable_id: str) -> StreamingResponse:
+    state, session = get_connected_session()
+    access_token = get_valid_access_token(state, session)
+    realm_id = session["realm_id"]
+
+    attachable = qbo_read_attachable(
+        access_token,
+        realm_id,
+        attachable_id,
+    )
+    temp_url = qbo_get_attachment_download_url(
+        access_token,
+        realm_id,
+        attachable_id,
+    )
+
+    try:
+        file_response = requests.get(
+            temp_url,
+            stream=True,
+            timeout=180,
+        )
+        file_response.raise_for_status()
+    except requests.RequestException as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not download attachment {attachable_id}: {exc}",
+        ) from exc
+
+    filename = sanitize_filename(
+        attachable.get("FileName")
+        or f"attachment_{attachable_id}"
+    )
+    content_type = (
+        attachable.get("ContentType")
+        or file_response.headers.get("Content-Type")
+        or "application/octet-stream"
+    )
+
+    return StreamingResponse(
+        file_response.iter_content(chunk_size=1024 * 256),
+        media_type=content_type,
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{filename}"'
+            )
+        },
+    )
+
+
 @app.get("/attachments/{attachable_id}/open")
 def open_attachment(attachable_id: str) -> RedirectResponse:
     state, session = get_connected_session()
@@ -642,6 +694,10 @@ def attachment_for_response(attachable: dict) -> dict:
         "open_url": (
             f"{PUBLIC_BASE_URL}/attachments/"
             f"{quote(attachment_id, safe='')}/open"
+        ),
+        "download_url": (
+            f"{PUBLIC_BASE_URL}/attachments/"
+            f"{quote(attachment_id, safe='')}/download"
         ),
     }
 
