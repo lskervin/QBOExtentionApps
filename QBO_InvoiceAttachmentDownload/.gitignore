@@ -8,3 +8,25 @@ __pycache__/
 *.log
 .DS_Store
 Thumbs.db
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Installer output
+installer_output/
+
+# Local installer assets
+*.iss.tmp
+
+# PyInstaller output
+QBO_InvoiceAttachmentDownload/build/
+QBO_InvoiceAttachmentDownload/dist/
+QBO_InvoiceAttachmentDownload/*.spec
+
+# Inno Setup output
+QBO_InvoiceAttachmentDownload/installer_output/
+
+# Python cache
+__pycache__/
+*.py[cod]

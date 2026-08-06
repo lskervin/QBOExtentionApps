@@ -19,7 +19,42 @@ from typing import Callable, Optional
 from urllib.parse import quote
 import customtkinter as ctk
 import xlsxwriter
+import sys
 
+
+def get_bundled_path(relative_path: str) -> Path:
+    """
+    Returns a path that works both during normal Python execution
+    and when packaged with PyInstaller.
+    """
+    if getattr(sys, "frozen", False):
+        base_path = Path(sys.executable).resolve().parent
+    else:
+        base_path = Path(__file__).resolve().parent
+
+    return base_path / relative_path
+
+
+def configure_tesseract() -> None:
+    if pytesseract is None:
+        return
+
+    bundled_tesseract = get_bundled_path(
+        r"tesseract\tesseract.exe"
+    )
+
+    installed_tesseract = Path(
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    )
+
+    if bundled_tesseract.exists():
+        pytesseract.pytesseract.tesseract_cmd = str(
+            bundled_tesseract
+        )
+    elif installed_tesseract.exists():
+        pytesseract.pytesseract.tesseract_cmd = str(
+            installed_tesseract
+        )
 # Optional local attachment-analysis dependencies.
 try:
     import pytesseract
@@ -2559,5 +2594,7 @@ class QBOExtensionApp(ctk.CTk):
 
 
 if __name__ == "__main__":
+    configure_tesseract()
+
     app = QBOExtensionApp()
     app.mainloop()
