@@ -10,6 +10,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Callable, Optional
+from urllib.parse import quote
 import customtkinter as ctk
 import xlsxwriter
 
@@ -727,6 +728,7 @@ class InvoiceAttachmentsPage(Page):
         vscroll.grid(row=0, column=1, sticky="ns", padx=(0, 12), pady=(12, 0))
         hscroll.grid(row=1, column=0, sticky="ew", padx=(12, 0), pady=(0, 12))
         self.tree.bind("<Double-1>", self.show_selected_invoice)
+        self.tree.bind("<ButtonRelease-1>", self.open_invoice_from_number_click)
 
     def on_show(self) -> None:
         if not self.invoices and not self.loading:
@@ -824,6 +826,23 @@ class InvoiceAttachmentsPage(Page):
         for index, (_, item_id) in enumerate(rows):
             self.tree.move(item_id, "", index)
         self.tree.heading(column, command=lambda: self.sort_by_column(column, not descending))
+
+
+    def open_invoice_from_number_click(self, event) -> None:
+        region = self.tree.identify_region(event.x, event.y)
+        column = self.tree.identify_column(event.x)
+        item_id = self.tree.identify_row(event.y)
+
+        if region != "cell" or column != "#1" or not item_id:
+            return
+
+        values = self.tree.item(item_id, "values")
+        if not values or len(values) < 8:
+            return
+
+        detail_page = self.app.pages["invoice_detail"]
+        detail_page.load_invoice(str(values[7]), str(values[0]))
+        self.app.show_page("invoice_detail")
 
     def export_table_to_xlsx(self) -> None:
         """
@@ -1090,6 +1109,390 @@ class InvoiceAttachmentsPage(Page):
             f"Invoice: {values[0]}\nDate: {values[1]}\nCustomer: {values[2]}\n"
             f"Total: {values[3]}\nBalance: {values[4]}\nQBO ID: {values[7]}",
         )
+
+
+
+# ============================================================
+# INVOICE LINE DETAILS PAGE
+# ============================================================
+
+class InvoiceLineDetailsPage(Page):
+    COLUMNS = ("line_number", "description", "amount", "attachment", "status")
+
+    HEADINGS = {
+        "line_number": "Line",
+        "description": "Description",
+        "amount": "Amount",
+        "attachment": "Attachment",
+        "status": "Status",
+    }
+
+    WIDTHS = {
+        "line_number": 70,
+        "description": 390,
+        "amount": 110,
+        "attachment": 260,
+        "status": 150,
+    }
+
+    def __init__(self, master, app: "QBOExtensionApp"):
+        super().__init__(master, app)
+        self.invoice_id = ""
+        self.doc_number = ""
+        self.loading = False
+        self.line_records: dict[str, dict] = {}
+
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(3, weight=1)
+
+        top_bar = ctk.CTkFrame(self, fg_color="transparent")
+        top_bar.grid(row=0, column=0, padx=8, pady=(10, 5), sticky="ew")
+        top_bar.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkButton(
+            top_bar,
+            text="← Back to Invoices",
+            width=150,
+            fg_color="transparent",
+            border_width=1,
+            text_color=("gray15", "gray90"),
+            command=lambda: self.app.show_page("invoice"),
+        ).grid(row=0, column=0, padx=(0, 14), sticky="w")
+
+        self.title_label = ctk.CTkLabel(
+            top_bar,
+            text="Invoice Details",
+            font=ctk.CTkFont(size=28, weight="bold"),
+            anchor="w",
+        )
+        self.title_label.grid(row=0, column=1, sticky="ew")
+
+        action_frame = ctk.CTkFrame(self, fg_color="transparent")
+        action_frame.grid(row=1, column=0, padx=8, pady=(0, 12), sticky="ew")
+        action_frame.grid_columnconfigure(0, weight=1)
+
+        self.summary_label = ctk.CTkLabel(
+            action_frame,
+            text="Select an invoice.",
+            text_color=("gray35", "gray70"),
+            anchor="w",
+        )
+        self.summary_label.grid(row=0, column=0, sticky="ew")
+
+        self.open_attachment_button = ctk.CTkButton(
+            action_frame,
+            text="Open Attachment",
+            width=145,
+            command=self.open_selected_attachment,
+            state="disabled",
+        )
+        self.open_attachment_button.grid(row=0, column=1, padx=(12, 8))
+
+        self.export_zip_button = ctk.CTkButton(
+            action_frame,
+            text="Export All as ZIP",
+            width=145,
+            fg_color="transparent",
+            border_width=1,
+            text_color=("gray15", "gray90"),
+            command=self.export_all_attachments_zip,
+            state="disabled",
+        )
+        self.export_zip_button.grid(row=0, column=2)
+
+        status_frame = ctk.CTkFrame(self, corner_radius=12)
+        status_frame.grid(row=2, column=0, padx=8, pady=(0, 12), sticky="ew")
+        status_frame.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            status_frame,
+            text="Status:",
+            font=ctk.CTkFont(weight="bold"),
+        ).grid(row=0, column=0, padx=(16, 8), pady=12, sticky="w")
+
+        self.status_label = ctk.CTkLabel(status_frame, text="Ready", anchor="w")
+        self.status_label.grid(row=0, column=1, pady=12, sticky="ew")
+
+        self.count_label = ctk.CTkLabel(
+            status_frame,
+            text="0 lines",
+            text_color=("gray35", "gray70"),
+        )
+        self.count_label.grid(row=0, column=2, padx=16, pady=12, sticky="e")
+
+        table_card = ctk.CTkFrame(self, corner_radius=14)
+        table_card.grid(row=3, column=0, padx=8, pady=(0, 8), sticky="nsew")
+        table_card.grid_columnconfigure(0, weight=1)
+        table_card.grid_rowconfigure(0, weight=1)
+
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure("InvoiceLine.Treeview", rowheight=34, font=("Segoe UI", 10))
+        style.configure("InvoiceLine.Treeview.Heading", font=("Segoe UI", 10, "bold"))
+
+        self.tree = ttk.Treeview(
+            table_card,
+            columns=self.COLUMNS,
+            show="headings",
+            style="InvoiceLine.Treeview",
+            selectmode="browse",
+        )
+
+        for column in self.COLUMNS:
+            self.tree.heading(column, text=self.HEADINGS[column])
+            self.tree.column(
+                column,
+                width=self.WIDTHS[column],
+                minwidth=65,
+                anchor="e" if column == "amount" else "w",
+                stretch=column == "description",
+            )
+
+        vscroll = ttk.Scrollbar(table_card, orient="vertical", command=self.tree.yview)
+        hscroll = ttk.Scrollbar(table_card, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vscroll.set, xscrollcommand=hscroll.set)
+        self.tree.grid(row=0, column=0, sticky="nsew", padx=(12, 0), pady=(12, 0))
+        vscroll.grid(row=0, column=1, sticky="ns", padx=(0, 12), pady=(12, 0))
+        hscroll.grid(row=1, column=0, sticky="ew", padx=(12, 0), pady=(0, 12))
+
+        self.tree.bind("<<TreeviewSelect>>", self.update_attachment_button)
+        self.tree.bind("<Double-1>", self.open_selected_attachment)
+
+    def load_invoice(self, invoice_id: str, doc_number: str) -> None:
+        self.invoice_id = str(invoice_id)
+        self.doc_number = str(doc_number)
+        self.title_label.configure(text=f"Invoice {self.doc_number}")
+        self.summary_label.configure(text="Loading invoice lines and attachments...")
+        self.status_label.configure(text="Loading...")
+        self.count_label.configure(text="0 lines")
+        self.open_attachment_button.configure(state="disabled")
+        self.export_zip_button.configure(state="disabled")
+        self.line_records.clear()
+
+        for item_id in self.tree.get_children():
+            self.tree.delete(item_id)
+
+        self.loading = True
+        threading.Thread(target=self._load_worker, daemon=True).start()
+
+    def _load_worker(self) -> None:
+        try:
+            response = requests.get(
+                f"{RENDER_AUTH_BASE_URL}/invoices/{quote(self.invoice_id, safe='')}/detail",
+                timeout=120,
+            )
+            if response.status_code == 401:
+                raise RuntimeError(
+                    "The QuickBooks server session has expired. "
+                    "Open Settings → QuickBooks and reconnect."
+                )
+            response.raise_for_status()
+            payload = response.json()
+            self.after(0, lambda data=payload: self._load_succeeded(data))
+        except requests.RequestException as exc:
+            self.after(
+                0,
+                lambda error=exc: self._load_failed(
+                    "Could not load the invoice details.\n\n" + str(error)
+                ),
+            )
+        except Exception as exc:
+            self.after(0, lambda error=exc: self._load_failed(str(error)))
+
+    def _load_succeeded(self, payload: dict) -> None:
+        self.loading = False
+        invoice = payload.get("invoice", {})
+        lines = payload.get("lines", [])
+        unmatched = payload.get("unmatched_attachments", [])
+
+        customer_ref = invoice.get("CustomerRef") or {}
+        customer = customer_ref.get("name") or customer_ref.get("value") or ""
+
+        self.summary_label.configure(
+            text=(
+                f"{customer}  •  Date: {invoice.get('TxnDate', '')}  •  "
+                f"Total: {self.format_money(invoice.get('TotalAmt'))}  •  "
+                f"Balance: {self.format_money(invoice.get('Balance'))}"
+            )
+        )
+
+        for item_id in self.tree.get_children():
+            self.tree.delete(item_id)
+
+        self.line_records.clear()
+        attached_count = 0
+
+        for index, line in enumerate(lines):
+            attachments = line.get("attachments", [])
+            first_attachment = attachments[0] if attachments else None
+
+            if first_attachment:
+                attached_count += len(attachments)
+                attachment_name = first_attachment.get("file_name", "Open attachment")
+                status = (
+                    "Attachment available"
+                    if len(attachments) == 1
+                    else f"{len(attachments)} attachments"
+                )
+            else:
+                attachment_name = "Missing Attachment"
+                status = "Missing attachment"
+
+            item_id = self.tree.insert(
+                "",
+                "end",
+                values=(
+                    line.get("line_number", index + 1),
+                    line.get("description", ""),
+                    self.format_money(line.get("amount")),
+                    attachment_name,
+                    status,
+                ),
+            )
+            self.line_records[item_id] = line
+
+        self.count_label.configure(
+            text=f"{len(lines)} lines • {attached_count} attachments"
+        )
+
+        status_text = "Invoice details loaded."
+        if unmatched:
+            status_text += (
+                f" {len(unmatched)} invoice-level attachment"
+                f"{'' if len(unmatched) == 1 else 's'} could not be matched to a line."
+            )
+        self.status_label.configure(text=status_text)
+        self.export_zip_button.configure(
+            state="normal" if payload.get("attachment_count", 0) else "disabled"
+        )
+        self.update_attachment_button()
+
+    def _load_failed(self, message: str) -> None:
+        self.loading = False
+        self.status_label.configure(text="Could not load invoice details.")
+        messagebox.showerror("Invoice detail loading unsuccessful", message)
+
+    def update_attachment_button(self, _event=None) -> None:
+        selection = self.tree.selection()
+        if not selection:
+            self.open_attachment_button.configure(state="disabled")
+            return
+        line = self.line_records.get(selection[0], {})
+        self.open_attachment_button.configure(
+            state="normal" if line.get("attachments") else "disabled"
+        )
+
+    def open_selected_attachment(self, _event=None) -> None:
+        selection = self.tree.selection()
+        if not selection:
+            return
+
+        line = self.line_records.get(selection[0], {})
+        attachments = line.get("attachments", [])
+
+        if not attachments:
+            messagebox.showinfo(
+                "Missing attachment",
+                "No attachment was matched to this invoice line.",
+            )
+            return
+
+        if len(attachments) == 1:
+            self._open_attachment(attachments[0])
+            return
+
+        menu = tk.Menu(self, tearoff=False)
+        for attachment in attachments:
+            menu.add_command(
+                label=attachment.get("file_name", "Attachment"),
+                command=lambda item=attachment: self._open_attachment(item),
+            )
+        try:
+            menu.tk_popup(self.winfo_pointerx(), self.winfo_pointery())
+        finally:
+            menu.grab_release()
+
+    @staticmethod
+    def _open_attachment(attachment: dict) -> None:
+        open_url = attachment.get("open_url")
+        if not open_url:
+            messagebox.showerror(
+                "Attachment unavailable",
+                "The attachment link is unavailable.",
+            )
+            return
+        if not webbrowser.open(open_url):
+            messagebox.showerror(
+                "Could not open attachment",
+                "The attachment could not be opened in your browser.",
+            )
+
+    def export_all_attachments_zip(self) -> None:
+        if not self.invoice_id:
+            return
+
+        output_path = filedialog.asksaveasfilename(
+            title="Save invoice attachments ZIP",
+            defaultextension=".zip",
+            initialfile=f"Invoice_{self.doc_number}_Attachments.zip",
+            filetypes=[("ZIP archive", "*.zip"), ("All files", "*.*")],
+        )
+        if not output_path:
+            return
+
+        self.export_zip_button.configure(text="Downloading...", state="disabled")
+        self.status_label.configure(text="Downloading and building the ZIP archive...")
+        threading.Thread(
+            target=self._export_zip_worker,
+            args=(output_path,),
+            daemon=True,
+        ).start()
+
+    def _export_zip_worker(self, output_path: str) -> None:
+        try:
+            response = requests.get(
+                f"{RENDER_AUTH_BASE_URL}/invoices/{quote(self.invoice_id, safe='')}/attachments.zip",
+                stream=True,
+                timeout=300,
+            )
+            if response.status_code == 401:
+                raise RuntimeError(
+                    "The QuickBooks server session has expired. "
+                    "Open Settings → QuickBooks and reconnect."
+                )
+            response.raise_for_status()
+
+            with open(output_path, "wb") as output_file:
+                for chunk in response.iter_content(1024 * 256):
+                    if chunk:
+                        output_file.write(chunk)
+
+            self.after(0, lambda path=output_path: self._export_succeeded(path))
+        except Exception as exc:
+            self.after(0, lambda error=exc: self._export_failed(str(error)))
+
+    def _export_succeeded(self, output_path: str) -> None:
+        self.export_zip_button.configure(text="Export All as ZIP", state="normal")
+        self.status_label.configure(text="Attachment ZIP exported successfully.")
+        messagebox.showinfo(
+            "Export complete",
+            f"The attachments were saved to:\n\n{output_path}",
+        )
+
+    def _export_failed(self, message: str) -> None:
+        self.export_zip_button.configure(text="Export All as ZIP", state="normal")
+        self.status_label.configure(text="Could not export the attachment ZIP.")
+        messagebox.showerror("ZIP export unsuccessful", message)
+
+    @staticmethod
+    def format_money(value) -> str:
+        try:
+            return f"${float(value):,.2f}"
+        except (TypeError, ValueError):
+            return ""
 
 
 # ============================================================
@@ -1515,6 +1918,10 @@ class QBOExtensionApp(ctk.CTk):
                 self.main_container,
                 self,
             ),
+            "invoice_detail": InvoiceLineDetailsPage(
+                self.main_container,
+                self,
+            ),
             "settings": SettingsPage(self.main_container, self),
             "help": HelpPage(self.main_container, self),
         }
@@ -1542,11 +1949,12 @@ class QBOExtensionApp(ctk.CTk):
 
         # The QuickBooks connection page is accessed from Settings,
         # so keep Settings highlighted while that page is open.
-        active_nav_key = (
-            "settings"
-            if page_key == "connection"
-            else page_key
-        )
+        if page_key == "connection":
+            active_nav_key = "settings"
+        elif page_key == "invoice_detail":
+            active_nav_key = "invoice"
+        else:
+            active_nav_key = page_key
 
         for key, button in self.nav_buttons.items():
             if key == active_nav_key:

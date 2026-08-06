@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import base64
+import io
+import re
+import zipfile
+from difflib import SequenceMatcher
 import os
 import secrets
 import time
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import requests
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel
 
 
@@ -18,6 +22,10 @@ app = FastAPI(title="QBO Extension Apps Auth Server")
 CLIENT_ID = os.environ["QBO_CLIENT_ID"]
 CLIENT_SECRET = os.environ["QBO_CLIENT_SECRET"]
 REDIRECT_URI = os.environ["QBO_REDIRECT_URI"]
+PUBLIC_BASE_URL = os.environ.get(
+    "PUBLIC_BASE_URL",
+    REDIRECT_URI.rsplit("/qbo/callback", 1)[0],
+).rstrip("/")
 
 AUTHORIZATION_URL = "https://appcenter.intuit.com/connect/oauth2"
 TOKEN_URL = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
@@ -201,7 +209,12 @@ def get_pending_invoices() -> dict:
     page_size = 1000
 
     while True:
-        query = f"SELECT * FROM Invoice STARTPOSITION {start_position} MAXRESULTS {page_size}"
+        query = (
+            "SELECT * FROM Invoice "
+            "WHERE Balance > '0' "
+            f"STARTPOSITION {start_position} "
+            f"MAXRESULTS {page_size}"
+        )
         response = requests.get(
             f"{QBO_API_BASE_URL}/{realm_id}/query",
             headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
@@ -235,6 +248,353 @@ def get_pending_invoices() -> dict:
         and float(invoice.get("Balance") or 0) > 0
     ]
     return {"count": len(filtered), "invoices": filtered}
+
+
+
+@app.get("/invoices/{invoice_id}/detail")
+def get_invoice_detail(invoice_id: str) -> dict:
+    state, session = get_connected_session()
+    access_token = get_valid_access_token(state, session)
+    realm_id = session["realm_id"]
+
+    invoice = qbo_get_invoice(access_token, realm_id, invoice_id)
+    attachables = qbo_get_invoice_attachables(access_token, realm_id, invoice_id)
+
+    lines = extract_invoice_lines(invoice)
+    mapped_lines, unmatched = match_attachments_to_lines(lines, attachables)
+
+    attachment_count = sum(
+        len(line.get("attachments", []))
+        for line in mapped_lines
+    ) + len(unmatched)
+
+    return {
+        "invoice": invoice,
+        "lines": mapped_lines,
+        "unmatched_attachments": unmatched,
+        "attachment_count": attachment_count,
+    }
+
+
+@app.get("/attachments/{attachable_id}/open")
+def open_attachment(attachable_id: str) -> RedirectResponse:
+    state, session = get_connected_session()
+    access_token = get_valid_access_token(state, session)
+    realm_id = session["realm_id"]
+
+    temp_url = qbo_get_attachment_download_url(
+        access_token,
+        realm_id,
+        attachable_id,
+    )
+    return RedirectResponse(url=temp_url, status_code=302)
+
+
+@app.get("/invoices/{invoice_id}/attachments.zip")
+def export_invoice_attachments_zip(invoice_id: str) -> StreamingResponse:
+    state, session = get_connected_session()
+    access_token = get_valid_access_token(state, session)
+    realm_id = session["realm_id"]
+
+    invoice = qbo_get_invoice(access_token, realm_id, invoice_id)
+    attachables = qbo_get_invoice_attachables(access_token, realm_id, invoice_id)
+
+    if not attachables:
+        raise HTTPException(status_code=404, detail="This invoice has no attachments.")
+
+    lines = extract_invoice_lines(invoice)
+    mapped_lines, _ = match_attachments_to_lines(lines, attachables)
+
+    attachment_to_line = {}
+    for line in mapped_lines:
+        for attachment in line.get("attachments", []):
+            attachment_to_line[str(attachment["id"])] = line
+
+    memory_file = io.BytesIO()
+    used_names = set()
+
+    with zipfile.ZipFile(memory_file, "w", zipfile.ZIP_DEFLATED) as archive:
+        for attachment in attachables:
+            attachment_id = str(attachment.get("Id", ""))
+            original_name = sanitize_filename(
+                attachment.get("FileName") or f"attachment_{attachment_id}"
+            )
+
+            temp_url = qbo_get_attachment_download_url(
+                access_token,
+                realm_id,
+                attachment_id,
+            )
+            file_response = requests.get(temp_url, timeout=120)
+            file_response.raise_for_status()
+
+            matched_line = attachment_to_line.get(attachment_id)
+            extension = (
+                "." + original_name.rsplit(".", 1)[1]
+                if "." in original_name
+                else ""
+            )
+
+            if matched_line:
+                zip_name = sanitize_filename(
+                    f"{matched_line['line_number']} - "
+                    f"${float(matched_line['amount']):.2f} - "
+                    f"{matched_line['description']}{extension}"
+                )
+            else:
+                zip_name = sanitize_filename(f"REVIEW - {original_name}")
+
+            zip_name = unique_archive_name(zip_name, used_names)
+            archive.writestr(zip_name, file_response.content)
+
+        missing_lines = [
+            line for line in mapped_lines
+            if not line.get("attachments")
+        ]
+
+        if missing_lines:
+            report = [
+                f"Invoice {invoice.get('DocNumber', invoice_id)} - Missing Attachments",
+                "=" * 65,
+                "",
+            ]
+            for line in missing_lines:
+                report.append(
+                    f"Line {line['line_number']} | "
+                    f"${float(line['amount']):.2f} | "
+                    f"{line['description']}"
+                )
+
+            archive.writestr(
+                sanitize_filename(
+                    f"{invoice.get('DocNumber', invoice_id)} - Missing Attachments.txt"
+                ),
+                "\n".join(report),
+            )
+
+    memory_file.seek(0)
+    doc_number = sanitize_filename(str(invoice.get("DocNumber") or invoice_id))
+
+    return StreamingResponse(
+        memory_file,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="Invoice_{doc_number}_Attachments.zip"'
+            )
+        },
+    )
+
+
+def qbo_get_invoice(access_token: str, realm_id: str, invoice_id: str) -> dict:
+    escaped_id = str(invoice_id).replace("'", "\\'")
+    data = qbo_query_request(
+        access_token,
+        realm_id,
+        f"SELECT * FROM Invoice WHERE Id = '{escaped_id}'",
+    )
+    invoices = data.get("QueryResponse", {}).get("Invoice", [])
+    if not invoices:
+        raise HTTPException(status_code=404, detail=f"Invoice {invoice_id} was not found.")
+    return invoices[0]
+
+
+def qbo_get_invoice_attachables(
+    access_token: str,
+    realm_id: str,
+    invoice_id: str,
+) -> list[dict]:
+    escaped_id = str(invoice_id).replace("'", "\\'")
+    query = (
+        "SELECT * FROM Attachable "
+        "WHERE AttachableRef.EntityRef.Type = 'Invoice' "
+        f"AND AttachableRef.EntityRef.value = '{escaped_id}'"
+    )
+    data = qbo_query_request(access_token, realm_id, query)
+    return data.get("QueryResponse", {}).get("Attachable", [])
+
+
+def qbo_query_request(access_token: str, realm_id: str, query: str) -> dict:
+    response = requests.get(
+        f"{QBO_API_BASE_URL}/{realm_id}/query",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+        },
+        params={"query": query, "minorversion": "75"},
+        timeout=60,
+    )
+    data = response.json()
+    if not response.ok:
+        raise HTTPException(
+            status_code=502,
+            detail=f"QuickBooks query failed: {data.get('Fault') or response.reason}",
+        )
+    return data
+
+
+def qbo_get_attachment_download_url(
+    access_token: str,
+    realm_id: str,
+    attachable_id: str,
+) -> str:
+    response = requests.get(
+        f"{QBO_API_BASE_URL}/{realm_id}/download/{quote(str(attachable_id), safe='')}",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "text/plain",
+        },
+        timeout=60,
+    )
+    if not response.ok:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not create a download link for attachment {attachable_id}.",
+        )
+
+    temp_url = response.text.strip()
+    if not temp_url.startswith("http"):
+        raise HTTPException(
+            status_code=502,
+            detail="QuickBooks returned an invalid attachment URL.",
+        )
+    return temp_url
+
+
+def extract_invoice_lines(invoice: dict) -> list[dict]:
+    output = []
+
+    for index, line in enumerate(invoice.get("Line", []) or [], start=1):
+        detail_type = str(line.get("DetailType") or "")
+        if detail_type in {"SubTotalLineDetail", "DiscountLineDetail"}:
+            continue
+
+        amount = line.get("Amount")
+        if amount is None:
+            continue
+
+        description = str(line.get("Description") or "").strip()
+        if not description:
+            description = f"Invoice line {line.get('Id') or index}"
+
+        output.append(
+            {
+                "line_number": line.get("LineNum") or line.get("Id") or index,
+                "line_id": str(line.get("Id") or ""),
+                "description": description,
+                "amount": float(amount),
+                "detail_type": detail_type,
+                "attachments": [],
+            }
+        )
+
+    return output
+
+
+def match_attachments_to_lines(lines: list[dict], attachables: list[dict]):
+    remaining_indexes = list(range(len(lines)))
+    unmatched = []
+
+    for attachable in attachables:
+        attachment = attachment_for_response(attachable)
+        filename = attachment["file_name"]
+        filename_amount = amount_from_filename(filename)
+        candidates = []
+
+        for line_index in remaining_indexes:
+            line = lines[line_index]
+            score = 0.0
+
+            if (
+                filename_amount is not None
+                and abs(
+                    round(filename_amount, 2)
+                    - round(float(line["amount"]), 2)
+                ) <= 0.01
+            ):
+                score += 100.0
+
+            score += (
+                SequenceMatcher(
+                    None,
+                    normalize_text(filename),
+                    normalize_text(line["description"]),
+                ).ratio()
+                * 25.0
+            )
+            candidates.append((score, line_index))
+
+        candidates.sort(reverse=True)
+
+        if candidates and candidates[0][0] >= 80:
+            _, best_index = candidates[0]
+            lines[best_index]["attachments"].append(attachment)
+            remaining_indexes.remove(best_index)
+        else:
+            unmatched.append(attachment)
+
+    return lines, unmatched
+
+
+def attachment_for_response(attachable: dict) -> dict:
+    attachment_id = str(attachable.get("Id") or "")
+    return {
+        "id": attachment_id,
+        "file_name": attachable.get("FileName") or f"attachment_{attachment_id}",
+        "content_type": attachable.get("ContentType") or "",
+        "open_url": (
+            f"{PUBLIC_BASE_URL}/attachments/"
+            f"{quote(attachment_id, safe='')}/open"
+        ),
+    }
+
+
+def amount_from_filename(filename: str):
+    cleaned = str(filename or "").replace(",", "")
+    match = re.search(r"(?<!\\d)(\\d+\\.\\d{2})(?!\\d)", cleaned)
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
+
+
+def normalize_text(value: str) -> str:
+    return " ".join(
+        re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).split()
+    )
+
+
+def sanitize_filename(value: str) -> str:
+    cleaned = re.sub(
+        r'[<>:"/\\\\|?*\\x00-\\x1F]',
+        "_",
+        str(value or "").strip(),
+    )
+    return cleaned.rstrip(". ").strip() or "attachment"
+
+
+def unique_archive_name(filename: str, used_names: set[str]) -> str:
+    if filename not in used_names:
+        used_names.add(filename)
+        return filename
+
+    if "." in filename:
+        stem, extension = filename.rsplit(".", 1)
+        extension = "." + extension
+    else:
+        stem = filename
+        extension = ""
+
+    counter = 2
+    while True:
+        candidate = f"{stem} ({counter}){extension}"
+        if candidate not in used_names:
+            used_names.add(candidate)
+            return candidate
+        counter += 1
+
 
 
 def get_connected_session() -> tuple[str, dict]:
