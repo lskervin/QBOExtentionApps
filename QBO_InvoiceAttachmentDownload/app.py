@@ -1,7 +1,6 @@
 from __future__ import annotations
 import json
 import os
-import queue
 import threading
 import time
 import webbrowser
@@ -12,6 +11,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Callable, Optional
 import customtkinter as ctk
+import xlsxwriter
 
 
 # ============================================================
@@ -45,7 +45,6 @@ CONFIG_FILE = get_app_data_dir() / "settings.json"
 class AppSettings:
     qbo_company_name: str = ""
     qbo_connected: bool = False
-    divvy_export_path: str = ""
     receipt_folder: str = ""
     output_folder: str = ""
     archive_folder: str = ""
@@ -199,7 +198,7 @@ class HomePage(Page):
 
         ctk.CTkLabel(
             self,
-            text="Choose a task to get started.",
+            text="Choose a QuickBooks tool to get started.",
             text_color=("gray35", "gray70"),
             font=ctk.CTkFont(size=15),
             anchor="w",
@@ -209,7 +208,7 @@ class HomePage(Page):
             self,
             "QuickBooks",
             "Not connected",
-            "Connect before uploading",
+            "Connect before using tools",
         )
         self.connection_card.grid(row=2, column=0, padx=8, pady=8, sticky="nsew")
 
@@ -237,7 +236,7 @@ class HomePage(Page):
             action_card,
             column=0,
             title="Invoices",
-            description="Download and organize invoice attachments.",
+            description="Review, export, and manage QuickBooks invoices.",
             command=lambda: app.show_page("invoice"),
         )
 
@@ -280,7 +279,7 @@ class HomePage(Page):
                 "Ready to use",
             )
         else:
-            self.connection_card.update_value("Not connected", "Connect before uploading")
+            self.connection_card.update_value("Not connected", "Connect before using tools")
             self.company_card.update_value("—", "No company selected")
 
         if self.app.last_job:
@@ -596,466 +595,6 @@ class ConnectionPage(Page):
 
 
 # ============================================================
-# DIVVY WIZARD
-# ============================================================
-
-class DivvyWizardPage(Page):
-    STEP_TITLES = [
-        "QuickBooks",
-        "Divvy export",
-        "Receipt folder",
-        "Review",
-        "Upload",
-    ]
-
-    def __init__(self, master, app: "QBOExtensionApp"):
-        super().__init__(master, app)
-        self.current_step = 0
-        self.worker_queue: queue.Queue = queue.Queue()
-        self.processing = False
-
-        self.export_var = tk.StringVar(value=app.settings.divvy_export_path)
-        self.receipt_var = tk.StringVar(value=app.settings.receipt_folder)
-        self.output_var = tk.StringVar(value=app.settings.output_folder)
-
-        self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(3, weight=1)
-
-        ctk.CTkLabel(
-            self,
-            text="Upload Divvy receipts",
-            font=ctk.CTkFont(size=28, weight="bold"),
-            anchor="w",
-        ).grid(row=0, column=0, padx=8, pady=(10, 3), sticky="ew")
-
-        self.step_label = ctk.CTkLabel(
-            self,
-            text="",
-            text_color=("gray35", "gray70"),
-            anchor="w",
-        )
-        self.step_label.grid(row=1, column=0, padx=8, pady=(0, 8), sticky="ew")
-
-        self.step_progress = ctk.CTkProgressBar(self)
-        self.step_progress.grid(row=2, column=0, padx=8, pady=(0, 16), sticky="ew")
-
-        self.content = ctk.CTkFrame(self, corner_radius=14)
-        self.content.grid(row=3, column=0, padx=8, pady=8, sticky="nsew")
-        self.content.grid_columnconfigure(0, weight=1)
-        self.content.grid_rowconfigure(0, weight=1)
-
-        self.footer = ctk.CTkFrame(self, fg_color="transparent")
-        self.footer.grid(row=4, column=0, padx=8, pady=(14, 5), sticky="ew")
-        self.footer.grid_columnconfigure(1, weight=1)
-
-        self.back_button = ctk.CTkButton(
-            self.footer,
-            text="Back",
-            width=105,
-            fg_color="transparent",
-            border_width=1,
-            text_color=("gray15", "gray90"),
-            command=self.go_back,
-        )
-        self.back_button.grid(row=0, column=0)
-
-        self.next_button = ctk.CTkButton(
-            self.footer,
-            text="Next",
-            width=120,
-            command=self.go_next,
-        )
-        self.next_button.grid(row=0, column=2)
-
-        self.render_step()
-
-    def clear_content(self) -> None:
-        for widget in self.content.winfo_children():
-            widget.destroy()
-
-    def render_step(self) -> None:
-        self.clear_content()
-
-        self.step_label.configure(
-            text=f"Step {self.current_step + 1} of {len(self.STEP_TITLES)} · "
-                 f"{self.STEP_TITLES[self.current_step]}"
-        )
-        self.step_progress.set((self.current_step + 1) / len(self.STEP_TITLES))
-        self.back_button.configure(
-            state="disabled" if self.current_step == 0 or self.processing else "normal"
-        )
-
-        renderers = [
-            self.render_connection_step,
-            self.render_export_step,
-            self.render_receipt_step,
-            self.render_review_step,
-            self.render_upload_step,
-        ]
-        renderers[self.current_step]()
-
-    def render_connection_step(self) -> None:
-        frame = ctk.CTkFrame(self.content, fg_color="transparent")
-        frame.grid(row=0, column=0, padx=30, pady=30, sticky="nsew")
-        frame.grid_columnconfigure(0, weight=1)
-
-        connected = self.app.settings.qbo_connected
-        company = self.app.settings.qbo_company_name
-
-        ctk.CTkLabel(
-            frame,
-            text="Connect to QuickBooks",
-            font=ctk.CTkFont(size=22, weight="bold"),
-            anchor="w",
-        ).grid(row=0, column=0, sticky="ew")
-
-        status_text = (
-            f"Connected to {company}" if connected else "QuickBooks is not connected."
-        )
-        ctk.CTkLabel(
-            frame,
-            text=status_text,
-            text_color=("gray35", "gray70"),
-            anchor="w",
-        ).grid(row=1, column=0, pady=(8, 18), sticky="ew")
-
-        ctk.CTkButton(
-            frame,
-            text="Manage QuickBooks Connection",
-            width=230,
-            command=lambda: self.app.show_page("connection"),
-        ).grid(row=2, column=0, sticky="w")
-
-        self.next_button.configure(
-            text="Next",
-            state="normal" if connected else "disabled",
-        )
-
-    def render_export_step(self) -> None:
-        frame = ctk.CTkFrame(self.content, fg_color="transparent")
-        frame.grid(row=0, column=0, padx=30, pady=30, sticky="nsew")
-        frame.grid_columnconfigure(0, weight=1)
-
-        ctk.CTkLabel(
-            frame,
-            text="Select the Divvy export",
-            font=ctk.CTkFont(size=22, weight="bold"),
-            anchor="w",
-        ).grid(row=0, column=0, sticky="ew")
-
-        ctk.CTkLabel(
-            frame,
-            text="Choose the CSV or Excel export containing the transactions.",
-            text_color=("gray35", "gray70"),
-            anchor="w",
-        ).grid(row=1, column=0, pady=(7, 22), sticky="ew")
-
-        selector = PathSelector(
-            frame,
-            "Divvy export file",
-            self.export_var,
-            self.select_export,
-            "Choose file",
-        )
-        selector.grid(row=2, column=0, sticky="ew")
-
-        self.next_button.configure(text="Next", state="normal")
-
-    def render_receipt_step(self) -> None:
-        frame = ctk.CTkFrame(self.content, fg_color="transparent")
-        frame.grid(row=0, column=0, padx=30, pady=30, sticky="nsew")
-        frame.grid_columnconfigure(0, weight=1)
-
-        ctk.CTkLabel(
-            frame,
-            text="Select the receipt folder",
-            font=ctk.CTkFont(size=22, weight="bold"),
-            anchor="w",
-        ).grid(row=0, column=0, sticky="ew")
-
-        ctk.CTkLabel(
-            frame,
-            text="Choose the folder containing the receipt PDFs and images.",
-            text_color=("gray35", "gray70"),
-            anchor="w",
-        ).grid(row=1, column=0, pady=(7, 22), sticky="ew")
-
-        receipt_selector = PathSelector(
-            frame,
-            "Receipt folder",
-            self.receipt_var,
-            self.select_receipt_folder,
-            "Choose folder",
-        )
-        receipt_selector.grid(row=2, column=0, pady=(0, 18), sticky="ew")
-
-        output_selector = PathSelector(
-            frame,
-            "Report/output folder",
-            self.output_var,
-            self.select_output_folder,
-            "Choose folder",
-        )
-        output_selector.grid(row=3, column=0, sticky="ew")
-
-        self.next_button.configure(text="Next", state="normal")
-
-    def render_review_step(self) -> None:
-        frame = ctk.CTkFrame(self.content, fg_color="transparent")
-        frame.grid(row=0, column=0, padx=30, pady=30, sticky="nsew")
-        frame.grid_columnconfigure(0, weight=1)
-
-        ctk.CTkLabel(
-            frame,
-            text="Review your selections",
-            font=ctk.CTkFont(size=22, weight="bold"),
-            anchor="w",
-        ).grid(row=0, column=0, sticky="ew")
-
-        company = self.app.settings.qbo_company_name or "Not selected"
-        details = [
-            ("QuickBooks company", company),
-            ("Divvy export", self.export_var.get() or "Not selected"),
-            ("Receipt folder", self.receipt_var.get() or "Not selected"),
-            ("Output folder", self.output_var.get() or "Not selected"),
-        ]
-
-        for row, (label, value) in enumerate(details, start=1):
-            item = ctk.CTkFrame(frame, corner_radius=10)
-            item.grid(row=row, column=0, pady=7, sticky="ew")
-            item.grid_columnconfigure(0, weight=1)
-
-            ctk.CTkLabel(
-                item,
-                text=label,
-                font=ctk.CTkFont(weight="bold"),
-                anchor="w",
-            ).grid(row=0, column=0, padx=16, pady=(12, 2), sticky="ew")
-
-            ctk.CTkLabel(
-                item,
-                text=value,
-                wraplength=760,
-                justify="left",
-                text_color=("gray35", "gray70"),
-                anchor="w",
-            ).grid(row=1, column=0, padx=16, pady=(0, 12), sticky="ew")
-
-        self.next_button.configure(text="Start upload", state="normal")
-
-    def render_upload_step(self) -> None:
-        frame = ctk.CTkFrame(self.content, fg_color="transparent")
-        frame.grid(row=0, column=0, padx=30, pady=30, sticky="nsew")
-        frame.grid_columnconfigure(0, weight=1)
-
-        self.upload_title = ctk.CTkLabel(
-            frame,
-            text="Preparing upload...",
-            font=ctk.CTkFont(size=22, weight="bold"),
-            anchor="w",
-        )
-        self.upload_title.grid(row=0, column=0, sticky="ew")
-
-        self.upload_status = ctk.CTkLabel(
-            frame,
-            text="Starting",
-            text_color=("gray35", "gray70"),
-            anchor="w",
-        )
-        self.upload_status.grid(row=1, column=0, pady=(7, 18), sticky="ew")
-
-        self.upload_progress = ctk.CTkProgressBar(frame)
-        self.upload_progress.grid(row=2, column=0, sticky="ew")
-        self.upload_progress.set(0)
-
-        self.upload_count = ctk.CTkLabel(
-            frame,
-            text="0 / 0",
-            anchor="w",
-        )
-        self.upload_count.grid(row=3, column=0, pady=(8, 20), sticky="ew")
-
-        self.log_box = ctk.CTkTextbox(frame, height=220)
-        self.log_box.grid(row=4, column=0, sticky="nsew")
-        self.log_box.configure(state="disabled")
-
-        self.processing = True
-        self.back_button.configure(state="disabled")
-        self.next_button.configure(text="Close", state="disabled")
-
-        self.start_demo_upload()
-
-    def append_log(self, message: str) -> None:
-        self.log_box.configure(state="normal")
-        self.log_box.insert("end", message + "\n")
-        self.log_box.see("end")
-        self.log_box.configure(state="disabled")
-
-    def start_demo_upload(self) -> None:
-        """
-        Replace demo_worker() with your real Divvy/QBO processing function.
-
-        Recommended real worker signature:
-            run_divvy_upload(
-                export_path: str,
-                receipt_folder: str,
-                output_folder: str,
-                progress_callback: Callable[[int, int, str], None],
-                log_callback: Callable[[str], None],
-            )
-        """
-
-        def demo_worker() -> None:
-            total = 75
-
-            for index in range(1, total + 1):
-                time.sleep(0.035)
-                self.worker_queue.put(
-                    ("progress", index, total, f"Processing receipt {index}.pdf")
-                )
-
-                if index % 12 == 0:
-                    self.worker_queue.put(
-                        ("log", f"Uploaded receipt {index}.pdf")
-                    )
-
-            self.worker_queue.put(
-                ("done", total, total, "Upload completed successfully.")
-            )
-
-        threading.Thread(target=demo_worker, daemon=True).start()
-        self.after(100, self.poll_worker_queue)
-
-    def poll_worker_queue(self) -> None:
-        try:
-            while True:
-                event = self.worker_queue.get_nowait()
-                event_type = event[0]
-
-                if event_type == "progress":
-                    _, current, total, status = event
-                    self.upload_progress.set(current / total)
-                    self.upload_count.configure(text=f"{current} / {total}")
-                    self.upload_status.configure(text=status)
-
-                elif event_type == "log":
-                    self.append_log(event[1])
-
-                elif event_type == "done":
-                    _, current, total, status = event
-                    self.processing = False
-                    self.upload_progress.set(1)
-                    self.upload_count.configure(text=f"{current} / {total}")
-                    self.upload_title.configure(text="Upload complete")
-                    self.upload_status.configure(text=status)
-                    self.append_log(status)
-                    self.next_button.configure(text="Finish", state="normal")
-
-                    self.app.last_job = "Divvy upload"
-                    self.app.last_job_detail = f"{total} receipts processed"
-
-                    return
-
-        except queue.Empty:
-            pass
-
-        if self.processing:
-            self.after(100, self.poll_worker_queue)
-
-    def select_export(self) -> None:
-        path = filedialog.askopenfilename(
-            title="Select Divvy export",
-            filetypes=[
-                ("Spreadsheet files", "*.csv *.xlsx *.xls"),
-                ("CSV files", "*.csv"),
-                ("Excel files", "*.xlsx *.xls"),
-                ("All files", "*.*"),
-            ],
-        )
-        if path:
-            self.export_var.set(path)
-
-    def select_receipt_folder(self) -> None:
-        path = filedialog.askdirectory(title="Select receipt folder")
-        if path:
-            self.receipt_var.set(path)
-
-    def select_output_folder(self) -> None:
-        path = filedialog.askdirectory(title="Select output folder")
-        if path:
-            self.output_var.set(path)
-
-    def validate_current_step(self) -> bool:
-        if self.current_step == 0 and not self.app.settings.qbo_connected:
-            messagebox.showwarning(
-                "QuickBooks connection required",
-                "Connect to QuickBooks before continuing.",
-            )
-            return False
-
-        if self.current_step == 1:
-            path = Path(self.export_var.get().strip())
-            if not path.is_file():
-                messagebox.showwarning(
-                    "Select an export",
-                    "Choose a valid Divvy export file.",
-                )
-                return False
-
-        if self.current_step == 2:
-            receipt_path = Path(self.receipt_var.get().strip())
-            output_path = Path(self.output_var.get().strip())
-
-            if not receipt_path.is_dir():
-                messagebox.showwarning(
-                    "Select a receipt folder",
-                    "Choose a valid receipt folder.",
-                )
-                return False
-
-            if not output_path.is_dir():
-                messagebox.showwarning(
-                    "Select an output folder",
-                    "Choose a valid output folder.",
-                )
-                return False
-
-        return True
-
-    def save_paths(self) -> None:
-        self.app.settings.divvy_export_path = self.export_var.get().strip()
-        self.app.settings.receipt_folder = self.receipt_var.get().strip()
-        self.app.settings.output_folder = self.output_var.get().strip()
-        self.app.save_settings()
-
-    def go_next(self) -> None:
-        if self.processing:
-            return
-
-        if self.current_step == len(self.STEP_TITLES) - 1:
-            self.current_step = 0
-            self.render_step()
-            self.app.show_page("home")
-            return
-
-        if not self.validate_current_step():
-            return
-
-        self.save_paths()
-        self.current_step += 1
-        self.render_step()
-
-    def go_back(self) -> None:
-        if self.current_step > 0 and not self.processing:
-            self.current_step -= 1
-            self.render_step()
-
-    def on_show(self) -> None:
-        if self.current_step == 0:
-            self.render_step()
-
-
-# ============================================================
 # INVOICE ATTACHMENTS PAGE
 # ============================================================
 
@@ -1105,10 +644,45 @@ class InvoiceAttachmentsPage(Page):
             text_color=("gray35", "gray70"), anchor="w",
         ).grid(row=0, column=0, sticky="ew")
 
-        self.refresh_button = ctk.CTkButton(
-            toolbar, text="Refresh invoices", width=135, command=self.refresh_invoices,
+        action_buttons = ctk.CTkFrame(
+            toolbar,
+            fg_color="transparent",
         )
-        self.refresh_button.grid(row=0, column=1, padx=(12, 0))
+        action_buttons.grid(
+            row=0,
+            column=1,
+            padx=(12, 0),
+            sticky="ne",
+        )
+
+        self.refresh_button = ctk.CTkButton(
+            action_buttons,
+            text="Refresh invoices",
+            width=145,
+            command=self.refresh_invoices,
+        )
+        self.refresh_button.grid(
+            row=0,
+            column=0,
+            pady=(0, 8),
+            sticky="ew",
+        )
+
+        self.export_button = ctk.CTkButton(
+            action_buttons,
+            text="Export to Excel",
+            width=145,
+            fg_color="transparent",
+            border_width=1,
+            text_color=("gray15", "gray90"),
+            command=self.export_table_to_xlsx,
+            state="disabled",
+        )
+        self.export_button.grid(
+            row=1,
+            column=0,
+            sticky="ew",
+        )
 
         status_frame = ctk.CTkFrame(self, corner_radius=12)
         status_frame.grid(row=2, column=0, padx=8, pady=(0, 12), sticky="ew")
@@ -1170,6 +744,7 @@ class InvoiceAttachmentsPage(Page):
             return
         self.loading = True
         self.refresh_button.configure(text="Loading...", state="disabled")
+        self.export_button.configure(state="disabled")
         self.status_label.configure(text="Loading invoices from QuickBooks...")
         threading.Thread(target=self._load_invoices_worker, daemon=True).start()
 
@@ -1197,6 +772,9 @@ class InvoiceAttachmentsPage(Page):
         self.loading = False
         self.invoices = invoices
         self.refresh_button.configure(text="Refresh invoices", state="normal")
+        self.export_button.configure(
+            state="normal" if invoices else "disabled"
+        )
         self.status_label.configure(text="Invoice list loaded.")
         self.count_label.configure(text=f"{len(invoices)} invoice{'' if len(invoices) == 1 else 's'}")
         self.populate_table(invoices)
@@ -1204,6 +782,9 @@ class InvoiceAttachmentsPage(Page):
     def _load_failed(self, message: str) -> None:
         self.loading = False
         self.refresh_button.configure(text="Refresh invoices", state="normal")
+        self.export_button.configure(
+            state="normal" if self.tree.get_children() else "disabled"
+        )
         self.status_label.configure(text="Could not load invoices.")
         messagebox.showerror("Invoice loading unsuccessful", message)
 
@@ -1244,6 +825,261 @@ class InvoiceAttachmentsPage(Page):
             self.tree.move(item_id, "", index)
         self.tree.heading(column, command=lambda: self.sort_by_column(column, not descending))
 
+    def export_table_to_xlsx(self) -> None:
+        """
+        Exports the rows currently displayed in the table, preserving
+        the user's current sort order.
+        """
+        item_ids = self.tree.get_children("")
+
+        if not item_ids:
+            messagebox.showinfo(
+                "Nothing to export",
+                "There are no invoices in the table to export.",
+            )
+            return
+
+        default_name = (
+            f"Pending_Invoices_"
+            f"{time.strftime('%Y-%m-%d')}.xlsx"
+        )
+
+        output_path = filedialog.asksaveasfilename(
+            title="Export invoice table",
+            defaultextension=".xlsx",
+            initialfile=default_name,
+            filetypes=[
+                ("Excel workbook", "*.xlsx"),
+                ("All files", "*.*"),
+            ],
+        )
+
+        if not output_path:
+            return
+
+        try:
+            workbook = xlsxwriter.Workbook(output_path)
+            worksheet = workbook.add_worksheet("Pending Invoices")
+
+            title_format = workbook.add_format(
+                {
+                    "bold": True,
+                    "font_size": 16,
+                    "align": "left",
+                    "valign": "vcenter",
+                }
+            )
+            subtitle_format = workbook.add_format(
+                {
+                    "font_color": "#666666",
+                    "italic": True,
+                }
+            )
+            header_format = workbook.add_format(
+                {
+                    "bold": True,
+                    "bg_color": "#D9EAF7",
+                    "border": 1,
+                    "align": "center",
+                    "valign": "vcenter",
+                }
+            )
+            text_format = workbook.add_format(
+                {
+                    "border": 1,
+                    "valign": "top",
+                }
+            )
+            date_format = workbook.add_format(
+                {
+                    "border": 1,
+                    "num_format": "mm/dd/yyyy",
+                    "valign": "top",
+                }
+            )
+            money_format = workbook.add_format(
+                {
+                    "border": 1,
+                    "num_format": "$#,##0.00",
+                    "valign": "top",
+                }
+            )
+            total_label_format = workbook.add_format(
+                {
+                    "bold": True,
+                    "top": 1,
+                    "align": "right",
+                }
+            )
+            total_money_format = workbook.add_format(
+                {
+                    "bold": True,
+                    "top": 1,
+                    "num_format": "$#,##0.00",
+                }
+            )
+
+            worksheet.merge_range(
+                "A1:H1",
+                "Pending QuickBooks Invoices",
+                title_format,
+            )
+            worksheet.merge_range(
+                "A2:H2",
+                (
+                    'PrintStatus = "NeedToPrint", '
+                    'EmailStatus = "NotSet", and Balance > 0'
+                ),
+                subtitle_format,
+            )
+
+            headers = [
+                self.HEADINGS[column]
+                for column in self.COLUMNS
+            ]
+
+            header_row = 3
+            for column_index, header in enumerate(headers):
+                worksheet.write(
+                    header_row,
+                    column_index,
+                    header,
+                    header_format,
+                )
+
+            total_amount = 0.0
+            total_balance = 0.0
+
+            for row_offset, item_id in enumerate(item_ids, start=1):
+                values = self.tree.item(item_id, "values")
+                excel_row = header_row + row_offset
+
+                for column_index, value in enumerate(values):
+                    if column_index in {3, 4}:
+                        numeric_value = self._money_to_float(value)
+                        worksheet.write_number(
+                            excel_row,
+                            column_index,
+                            numeric_value,
+                            money_format,
+                        )
+
+                        if column_index == 3:
+                            total_amount += numeric_value
+                        else:
+                            total_balance += numeric_value
+
+                    elif column_index == 1:
+                        try:
+                            parsed_date = time.strptime(
+                                str(value),
+                                "%Y-%m-%d",
+                            )
+                            excel_date = (
+                                parsed_date.tm_year,
+                                parsed_date.tm_mon,
+                                parsed_date.tm_mday,
+                            )
+                            from datetime import datetime
+                            worksheet.write_datetime(
+                                excel_row,
+                                column_index,
+                                datetime(*excel_date),
+                                date_format,
+                            )
+                        except (TypeError, ValueError):
+                            worksheet.write(
+                                excel_row,
+                                column_index,
+                                value,
+                                text_format,
+                            )
+
+                    else:
+                        worksheet.write(
+                            excel_row,
+                            column_index,
+                            value,
+                            text_format,
+                        )
+
+            last_data_row = header_row + len(item_ids)
+            totals_row = last_data_row + 1
+
+            worksheet.write(
+                totals_row,
+                2,
+                "Totals:",
+                total_label_format,
+            )
+            worksheet.write_number(
+                totals_row,
+                3,
+                total_amount,
+                total_money_format,
+            )
+            worksheet.write_number(
+                totals_row,
+                4,
+                total_balance,
+                total_money_format,
+            )
+
+            worksheet.freeze_panes(header_row + 1, 0)
+            worksheet.autofilter(
+                header_row,
+                0,
+                last_data_row,
+                len(headers) - 1,
+            )
+
+            column_widths = [
+                14, 12, 34, 14, 14, 17, 15, 12
+            ]
+            for index, width in enumerate(column_widths):
+                worksheet.set_column(index, index, width)
+
+            worksheet.set_row(0, 24)
+            worksheet.set_row(header_row, 22)
+
+            workbook.close()
+
+            self.status_label.configure(
+                text=f"Exported {len(item_ids)} invoices to Excel."
+            )
+
+            messagebox.showinfo(
+                "Export complete",
+                (
+                    f"{len(item_ids)} invoices were exported successfully.\n\n"
+                    f"{output_path}"
+                ),
+            )
+
+        except Exception as exc:
+            try:
+                workbook.close()
+            except Exception:
+                pass
+
+            messagebox.showerror(
+                "Export unsuccessful",
+                f"The Excel file could not be created.\n\n{exc}",
+            )
+
+    @staticmethod
+    def _money_to_float(value) -> float:
+        try:
+            return float(
+                str(value)
+                .replace("$", "")
+                .replace(",", "")
+                .strip()
+                or 0
+            )
+        except (TypeError, ValueError):
+            return 0.0
+
     def show_selected_invoice(self, _event=None) -> None:
         selection = self.tree.selection()
         if not selection:
@@ -1254,55 +1090,6 @@ class InvoiceAttachmentsPage(Page):
             f"Invoice: {values[0]}\nDate: {values[1]}\nCustomer: {values[2]}\n"
             f"Total: {values[3]}\nBalance: {values[4]}\nQBO ID: {values[7]}",
         )
-
-
-# ============================================================
-# PLACEHOLDER WORKFLOW PAGES
-# ============================================================
-
-class WorkflowPlaceholderPage(Page):
-    def __init__(
-        self,
-        master,
-        app: "QBOExtensionApp",
-        title: str,
-        description: str,
-    ):
-        super().__init__(master, app)
-        self.grid_columnconfigure(0, weight=1)
-
-        ctk.CTkLabel(
-            self,
-            text=title,
-            font=ctk.CTkFont(size=28, weight="bold"),
-            anchor="w",
-        ).grid(row=0, column=0, padx=8, pady=(10, 5), sticky="ew")
-
-        ctk.CTkLabel(
-            self,
-            text=description,
-            text_color=("gray35", "gray70"),
-            anchor="w",
-        ).grid(row=1, column=0, padx=8, pady=(0, 20), sticky="ew")
-
-        card = SectionCard(
-            self,
-            "Workflow shell ready",
-            "Connect your existing Python processing function to this page.",
-        )
-        card.grid(row=2, column=0, padx=8, pady=8, sticky="ew")
-
-        ctk.CTkLabel(
-            card,
-            text=(
-                "This screen is intentionally left as a clean placeholder. "
-                "Use the Divvy wizard as the pattern for file selection, "
-                "review, progress updates, logging, and completion results."
-            ),
-            wraplength=760,
-            justify="left",
-            anchor="w",
-        ).grid(row=2, column=0, padx=22, pady=(4, 18), sticky="ew")
 
 
 # ============================================================
@@ -1642,7 +1429,7 @@ class HelpPage(Page):
             "1. Open QuickBooks Connection and authorize your company.\n"
             "2. Select the workflow you want to run.\n"
             "3. Follow each step and review the selected files.\n"
-            "4. Keep the application open until processing is complete.\n\n"
+            "4. Keep the application open while a QuickBooks task is running.\n\n"
             "Troubleshooting\n"
             "• Confirm that the selected folders still exist.\n"
             "• Confirm that the export file is not open in Excel.\n"

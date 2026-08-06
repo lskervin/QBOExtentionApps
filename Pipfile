@@ -13,6 +13,7 @@ customtkinter = "*"
 python-dotenv = "*"
 keyring = "*"
 requests = "*"
+xlsxwriter = "*"
 
 [dev-packages]
 
