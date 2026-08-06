@@ -404,14 +404,92 @@ def qbo_get_invoice_attachables(
     realm_id: str,
     invoice_id: str,
 ) -> list[dict]:
+    """
+    Lists every attachment linked to the invoice.
+
+    QBO can return sparse Attachable records from a query. When that
+    happens, read each Attachable by ID so FileName, ContentType, and
+    AttachableRef are available to the desktop application.
+    """
     escaped_id = str(invoice_id).replace("'", "\\'")
     query = (
         "SELECT * FROM Attachable "
         "WHERE AttachableRef.EntityRef.Type = 'Invoice' "
         f"AND AttachableRef.EntityRef.value = '{escaped_id}'"
     )
+
     data = qbo_query_request(access_token, realm_id, query)
-    return data.get("QueryResponse", {}).get("Attachable", [])
+    queried = data.get("QueryResponse", {}).get("Attachable", []) or []
+
+    hydrated: list[dict] = []
+
+    for attachable in queried:
+        attachable_id = str(attachable.get("Id") or "").strip()
+        if not attachable_id:
+            continue
+
+        # Sparse query results may contain only Id/sparse.
+        if attachable.get("FileName") and attachable.get("ContentType"):
+            hydrated.append(attachable)
+            continue
+
+        hydrated.append(
+            qbo_read_attachable(
+                access_token,
+                realm_id,
+                attachable_id,
+            )
+        )
+
+    return hydrated
+
+
+def qbo_read_attachable(
+    access_token: str,
+    realm_id: str,
+    attachable_id: str,
+) -> dict:
+    response = requests.get(
+        (
+            f"{QBO_API_BASE_URL}/{realm_id}/attachable/"
+            f"{quote(str(attachable_id), safe='')}"
+        ),
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+        },
+        params={"minorversion": "75"},
+        timeout=60,
+    )
+
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"QuickBooks returned an unreadable response for "
+                f"attachment {attachable_id}."
+            ),
+        ) from exc
+
+    if not response.ok:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"QuickBooks could not read attachment "
+                f"{attachable_id}: {data.get('Fault') or response.reason}"
+            ),
+        )
+
+    attachable = data.get("Attachable")
+    if not attachable:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Attachment {attachable_id} was not returned by QuickBooks.",
+        )
+
+    return attachable
 
 
 def qbo_query_request(access_token: str, realm_id: str, query: str) -> dict:
@@ -492,36 +570,56 @@ def extract_invoice_lines(invoice: dict) -> list[dict]:
 
 
 def match_attachments_to_lines(lines: list[dict], attachables: list[dict]):
-    remaining_indexes = list(range(len(lines)))
+    """
+    Matches invoice-level attachments to invoice lines.
+
+    Strong signals:
+      1. Filename starts with the line number.
+      2. Filename contains the exact line amount.
+      3. Filename resembles the line description.
+
+    Attachments that cannot be matched confidently remain visible in the
+    desktop app under "Unmatched invoice attachments".
+    """
     unmatched = []
 
     for attachable in attachables:
         attachment = attachment_for_response(attachable)
         filename = attachment["file_name"]
+        normalized_filename = normalize_text(filename)
         filename_amount = amount_from_filename(filename)
         candidates = []
 
-        for line_index in remaining_indexes:
-            line = lines[line_index]
+        for line_index, line in enumerate(lines):
             score = 0.0
+            line_number = str(line.get("line_number") or "").strip()
+            line_amount = round(float(line.get("amount") or 0), 2)
+
+            # Many exported files are named:
+            # "Line - $Amount - Description.pdf"
+            if line_number and re.match(
+                rf"^\s*{re.escape(line_number)}(?:\s|[-_])",
+                filename,
+                flags=re.IGNORECASE,
+            ):
+                score += 150.0
 
             if (
                 filename_amount is not None
-                and abs(
-                    round(filename_amount, 2)
-                    - round(float(line["amount"]), 2)
-                ) <= 0.01
+                and abs(round(filename_amount, 2) - line_amount) <= 0.01
             ):
-                score += 100.0
+                score += 110.0
 
-            score += (
+            description_score = (
                 SequenceMatcher(
                     None,
-                    normalize_text(filename),
-                    normalize_text(line["description"]),
+                    normalized_filename,
+                    normalize_text(line.get("description", "")),
                 ).ratio()
-                * 25.0
+                * 40.0
             )
+            score += description_score
+
             candidates.append((score, line_index))
 
         candidates.sort(reverse=True)
@@ -529,7 +627,6 @@ def match_attachments_to_lines(lines: list[dict], attachables: list[dict]):
         if candidates and candidates[0][0] >= 80:
             _, best_index = candidates[0]
             lines[best_index]["attachments"].append(attachment)
-            remaining_indexes.remove(best_index)
         else:
             unmatched.append(attachment)
 

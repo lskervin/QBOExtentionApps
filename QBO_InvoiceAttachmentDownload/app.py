@@ -1261,6 +1261,44 @@ class InvoiceLineDetailsPage(Page):
         self.tree.bind("<<TreeviewSelect>>", self.update_attachment_button)
         self.tree.bind("<Double-1>", self.open_selected_attachment)
 
+        self.unmatched_frame = ctk.CTkFrame(self, corner_radius=12)
+        self.unmatched_frame.grid(
+            row=4,
+            column=0,
+            padx=8,
+            pady=(0, 8),
+            sticky="ew",
+        )
+        self.unmatched_frame.grid_columnconfigure(0, weight=1)
+
+        self.unmatched_title = ctk.CTkLabel(
+            self.unmatched_frame,
+            text="Unmatched invoice attachments",
+            font=ctk.CTkFont(weight="bold"),
+            anchor="w",
+        )
+        self.unmatched_title.grid(
+            row=0,
+            column=0,
+            padx=14,
+            pady=(10, 4),
+            sticky="ew",
+        )
+
+        self.unmatched_links = ctk.CTkFrame(
+            self.unmatched_frame,
+            fg_color="transparent",
+        )
+        self.unmatched_links.grid(
+            row=1,
+            column=0,
+            padx=14,
+            pady=(0, 10),
+            sticky="ew",
+        )
+
+        self.unmatched_frame.grid_remove()
+
     def load_invoice(self, invoice_id: str, doc_number: str) -> None:
         self.invoice_id = str(invoice_id)
         self.doc_number = str(doc_number)
@@ -1271,6 +1309,10 @@ class InvoiceLineDetailsPage(Page):
         self.open_attachment_button.configure(state="disabled")
         self.export_zip_button.configure(state="disabled")
         self.line_records.clear()
+        self.unmatched_frame.grid_remove()
+
+        for widget in self.unmatched_links.winfo_children():
+            widget.destroy()
 
         for item_id in self.tree.get_children():
             self.tree.delete(item_id)
@@ -1368,6 +1410,24 @@ class InvoiceLineDetailsPage(Page):
         self.export_zip_button.configure(
             state="normal" if payload.get("attachment_count", 0) else "disabled"
         )
+
+        if unmatched:
+            self.unmatched_frame.grid()
+
+            for attachment in unmatched:
+                link = ctk.CTkButton(
+                    self.unmatched_links,
+                    text=attachment.get("file_name", "Open attachment"),
+                    anchor="w",
+                    fg_color="transparent",
+                    hover_color=("gray85", "gray25"),
+                    text_color=("blue3", "sky blue"),
+                    command=lambda item=attachment: self._open_attachment(item),
+                )
+                link.pack(fill="x", pady=2)
+        else:
+            self.unmatched_frame.grid_remove()
+
         self.update_attachment_button()
 
     def _load_failed(self, message: str) -> None:
