@@ -30,3 +30,18 @@ QBO_InvoiceAttachmentDownload/installer_output/
 # Python cache
 __pycache__/
 *.py[cod]
+
+# Build artifacts
+QBO_InvoiceAttachmentDownload/build/
+QBO_InvoiceAttachmentDownload/dist/
+QBO_InvoiceAttachmentDownload/installer_output/
+
+# PyInstaller
+*.spec
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Tesseract (if bundled locally)
+tesseract/
