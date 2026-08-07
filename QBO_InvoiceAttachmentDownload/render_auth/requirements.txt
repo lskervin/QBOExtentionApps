@@ -1,3 +1,5 @@
 fastapi
 uvicorn[standard]
 requests
+psycopg2-binary==2.9.10
+cryptography>=44.0.0,<46

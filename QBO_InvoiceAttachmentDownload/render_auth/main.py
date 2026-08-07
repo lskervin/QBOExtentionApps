@@ -4,6 +4,7 @@ import base64
 import io
 import re
 import zipfile
+from contextlib import contextmanager
 from difflib import SequenceMatcher
 import os
 import secrets
@@ -11,6 +12,9 @@ import time
 from urllib.parse import quote, urlencode
 
 import requests
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from cryptography.fernet import Fernet, InvalidToken
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel
@@ -22,19 +26,357 @@ app = FastAPI(title="QBO Extension Apps Auth Server")
 CLIENT_ID = os.environ["QBO_CLIENT_ID"]
 CLIENT_SECRET = os.environ["QBO_CLIENT_SECRET"]
 REDIRECT_URI = os.environ["QBO_REDIRECT_URI"]
+DATABASE_URL = os.environ["DATABASE_URL"]
+TOKEN_ENCRYPTION_KEY = os.environ["TOKEN_ENCRYPTION_KEY"]
+
 PUBLIC_BASE_URL = os.environ.get(
     "PUBLIC_BASE_URL",
     REDIRECT_URI.rsplit("/qbo/callback", 1)[0],
 ).rstrip("/")
+
+try:
+    TOKEN_CIPHER = Fernet(TOKEN_ENCRYPTION_KEY.encode("utf-8"))
+except Exception as exc:
+    raise RuntimeError(
+        "TOKEN_ENCRYPTION_KEY must be a valid Fernet key."
+    ) from exc
 
 AUTHORIZATION_URL = "https://appcenter.intuit.com/connect/oauth2"
 TOKEN_URL = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
 QBO_SCOPE = "com.intuit.quickbooks.accounting"
 QBO_API_BASE_URL = "https://quickbooks.api.intuit.com/v3/company"
 
-# Temporary in-memory storage for testing.
-# Replace this with a persistent database before production use.
-oauth_sessions: dict[str, dict] = {}
+# OAuth login state and QBO tokens are persisted in PostgreSQL.
+# This survives Render restarts/redeploys and lets access tokens refresh
+# silently until the user explicitly disconnects or Intuit requires
+# reauthorization.
+
+
+@contextmanager
+def db_connection():
+    connection = psycopg2.connect(
+        DATABASE_URL,
+        cursor_factory=RealDictCursor,
+        sslmode="require",
+    )
+
+    try:
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def init_database() -> None:
+    with db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS oauth_connect_sessions (
+                    session_id TEXT PRIMARY KEY,
+                    state TEXT UNIQUE NOT NULL,
+                    status TEXT NOT NULL,
+                    realm_id TEXT,
+                    message TEXT,
+                    created_at DOUBLE PRECISION NOT NULL,
+                    updated_at DOUBLE PRECISION NOT NULL
+                )
+                """
+            )
+
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS qbo_connections (
+                    realm_id TEXT PRIMARY KEY,
+                    access_token_enc TEXT NOT NULL,
+                    refresh_token_enc TEXT NOT NULL,
+                    access_token_expires_at DOUBLE PRECISION NOT NULL,
+                    refresh_token_expires_in BIGINT,
+                    active BOOLEAN NOT NULL DEFAULT TRUE,
+                    connected_at DOUBLE PRECISION NOT NULL,
+                    updated_at DOUBLE PRECISION NOT NULL
+                )
+                """
+            )
+
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS
+                idx_qbo_connections_active
+                ON qbo_connections(active, updated_at DESC)
+                """
+            )
+
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS
+                idx_oauth_connect_sessions_state
+                ON oauth_connect_sessions(state)
+                """
+            )
+
+
+def encrypt_token(value: str) -> str:
+    return TOKEN_CIPHER.encrypt(
+        value.encode("utf-8")
+    ).decode("utf-8")
+
+
+def decrypt_token(value: str) -> str:
+    try:
+        return TOKEN_CIPHER.decrypt(
+            value.encode("utf-8")
+        ).decode("utf-8")
+    except InvalidToken as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Stored QuickBooks credentials could not be decrypted. "
+                "Check TOKEN_ENCRYPTION_KEY."
+            ),
+        ) from exc
+
+
+def save_connect_session(
+    session_id: str,
+    state: str,
+    status: str = "waiting",
+    realm_id: str | None = None,
+    message: str | None = None,
+) -> None:
+    now = time.time()
+
+    with db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO oauth_connect_sessions (
+                    session_id,
+                    state,
+                    status,
+                    realm_id,
+                    message,
+                    created_at,
+                    updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (session_id)
+                DO UPDATE SET
+                    state = EXCLUDED.state,
+                    status = EXCLUDED.status,
+                    realm_id = EXCLUDED.realm_id,
+                    message = EXCLUDED.message,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (
+                    session_id,
+                    state,
+                    status,
+                    realm_id,
+                    message,
+                    now,
+                    now,
+                ),
+            )
+
+
+def get_connect_session_by_state(
+    state: str,
+) -> dict | None:
+    with db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT *
+                FROM oauth_connect_sessions
+                WHERE state = %s
+                LIMIT 1
+                """,
+                (state,),
+            )
+            row = cursor.fetchone()
+
+    return dict(row) if row else None
+
+
+def get_connect_session_by_id(
+    session_id: str,
+) -> dict | None:
+    with db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT *
+                FROM oauth_connect_sessions
+                WHERE session_id = %s
+                LIMIT 1
+                """,
+                (session_id,),
+            )
+            row = cursor.fetchone()
+
+    return dict(row) if row else None
+
+
+def update_connect_session(
+    session_id: str,
+    *,
+    status: str,
+    realm_id: str | None = None,
+    message: str | None = None,
+) -> None:
+    with db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE oauth_connect_sessions
+                SET
+                    status = %s,
+                    realm_id = COALESCE(%s, realm_id),
+                    message = %s,
+                    updated_at = %s
+                WHERE session_id = %s
+                """,
+                (
+                    status,
+                    realm_id,
+                    message,
+                    time.time(),
+                    session_id,
+                ),
+            )
+
+
+def save_qbo_connection(
+    realm_id: str,
+    token_data: dict,
+) -> None:
+    now = time.time()
+    expires_in = int(
+        token_data.get("expires_in") or 3600
+    )
+
+    access_token = token_data.get("access_token")
+    refresh_token = token_data.get("refresh_token")
+
+    if not access_token or not refresh_token:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Intuit did not return both an access token "
+                "and refresh token."
+            ),
+        )
+
+    with db_connection() as connection:
+        with connection.cursor() as cursor:
+            # This desktop app currently works with one active QBO company.
+            cursor.execute(
+                """
+                UPDATE qbo_connections
+                SET active = FALSE
+                WHERE active = TRUE
+                """
+            )
+
+            cursor.execute(
+                """
+                INSERT INTO qbo_connections (
+                    realm_id,
+                    access_token_enc,
+                    refresh_token_enc,
+                    access_token_expires_at,
+                    refresh_token_expires_in,
+                    active,
+                    connected_at,
+                    updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, TRUE, %s, %s)
+                ON CONFLICT (realm_id)
+                DO UPDATE SET
+                    access_token_enc = EXCLUDED.access_token_enc,
+                    refresh_token_enc = EXCLUDED.refresh_token_enc,
+                    access_token_expires_at =
+                        EXCLUDED.access_token_expires_at,
+                    refresh_token_expires_in =
+                        EXCLUDED.refresh_token_expires_in,
+                    active = TRUE,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (
+                    str(realm_id),
+                    encrypt_token(access_token),
+                    encrypt_token(refresh_token),
+                    now + expires_in - 60,
+                    token_data.get(
+                        "x_refresh_token_expires_in"
+                    ),
+                    now,
+                    now,
+                ),
+            )
+
+
+def load_active_qbo_connection() -> dict | None:
+    with db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT *
+                FROM qbo_connections
+                WHERE active = TRUE
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """
+            )
+            row = cursor.fetchone()
+
+    if not row:
+        return None
+
+    result = dict(row)
+    result["access_token"] = decrypt_token(
+        result.pop("access_token_enc")
+    )
+    result["refresh_token"] = decrypt_token(
+        result.pop("refresh_token_enc")
+    )
+    result["status"] = "connected"
+
+    return result
+
+
+def delete_qbo_connection(realm_id: str) -> None:
+    with db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                DELETE FROM qbo_connections
+                WHERE realm_id = %s
+                """,
+                (str(realm_id),),
+            )
+
+
+def cleanup_old_connect_sessions() -> None:
+    # Login sessions are only temporary state. Keep 24 hours for debugging.
+    cutoff = time.time() - (24 * 60 * 60)
+
+    with db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                DELETE FROM oauth_connect_sessions
+                WHERE created_at < %s
+                """,
+                (cutoff,),
+            )
+
+
+init_database()
 
 
 class ConnectSessionResponse(BaseModel):
@@ -58,18 +400,21 @@ def health() -> dict[str, str]:
 @app.get("/connect")
 def connect() -> RedirectResponse:
     """
-    Browser-only test route.
-    Starts OAuth without creating a desktop polling session.
+    Browser-only OAuth test route.
     """
+    cleanup_old_connect_sessions()
+
+    session_id = secrets.token_urlsafe(32)
     state = secrets.token_urlsafe(32)
 
-    oauth_sessions[state] = {
-        "session_id": None,
-        "status": "waiting",
-    }
+    save_connect_session(
+        session_id=session_id,
+        state=state,
+    )
 
-    authorization_url = build_authorization_url(state)
-    return RedirectResponse(url=authorization_url)
+    return RedirectResponse(
+        url=build_authorization_url(state)
+    )
 
 
 @app.post("/connect-session", response_model=ConnectSessionResponse)
@@ -77,13 +422,15 @@ def create_connect_session() -> ConnectSessionResponse:
     """
     Creates an OAuth login session for the desktop application.
     """
+    cleanup_old_connect_sessions()
+
     session_id = secrets.token_urlsafe(32)
     state = secrets.token_urlsafe(32)
 
-    oauth_sessions[state] = {
-        "session_id": session_id,
-        "status": "waiting",
-    }
+    save_connect_session(
+        session_id=session_id,
+        state=state,
+    )
 
     return ConnectSessionResponse(
         session_id=session_id,
@@ -94,21 +441,110 @@ def create_connect_session() -> ConnectSessionResponse:
 @app.get("/connect-status/{session_id}")
 def connect_status(session_id: str) -> dict:
     """
-    Allows the desktop application to check whether OAuth completed.
+    Allows the desktop application to poll an OAuth login attempt.
+    The status survives Render restarts because it is stored in PostgreSQL.
     """
-    for session in oauth_sessions.values():
-        if session.get("session_id") == session_id:
-            return {
-                "status": session.get("status", "waiting"),
-                "connected": session.get("status") == "connected",
-                "realm_id": session.get("realm_id"),
-                "message": session.get("message"),
-            }
+    session = get_connect_session_by_id(session_id)
 
-    raise HTTPException(
-        status_code=404,
-        detail="Connection session was not found or expired.",
+    if not session:
+        raise HTTPException(
+            status_code=404,
+            detail="Connection session was not found or expired.",
+        )
+
+    return {
+        "status": session.get("status", "waiting"),
+        "connected": session.get("status") == "connected",
+        "realm_id": session.get("realm_id"),
+        "message": session.get("message"),
+    }
+
+
+@app.get("/connection-status")
+def connection_status() -> dict:
+    """
+    Returns the server's real persistent QBO connection state.
+    """
+    connection = load_active_qbo_connection()
+
+    if not connection:
+        return {
+            "connected": False,
+            "status": "not_connected",
+            "realm_id": None,
+        }
+
+    return {
+        "connected": True,
+        "status": "connected",
+        "realm_id": connection["realm_id"],
+    }
+
+
+@app.post("/disconnect")
+def disconnect() -> dict:
+    """
+    Revokes the active Intuit refresh token and removes the persistent
+    connection from PostgreSQL.
+    """
+    connection = load_active_qbo_connection()
+
+    if not connection:
+        return {
+            "disconnected": True,
+            "message": "No QuickBooks company was connected.",
+        }
+
+    credentials = (
+        f"{CLIENT_ID}:{CLIENT_SECRET}"
+    ).encode("utf-8")
+    encoded_credentials = base64.b64encode(
+        credentials
+    ).decode("ascii")
+
+    try:
+        response = requests.post(
+            "https://developer.api.intuit.com/v2/oauth2/tokens/revoke",
+            headers={
+                "Authorization": (
+                    f"Basic {encoded_credentials}"
+                ),
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+            json={
+                "token": connection["refresh_token"]
+            },
+            timeout=30,
+        )
+    except requests.RequestException as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Could not contact Intuit to revoke "
+                f"the connection: {exc}"
+            ),
+        ) from exc
+
+    # Intuit documents 200 as successful revocation. If the token is already
+    # invalid/expired, a 400 should not trap the desktop in a connected state.
+    if response.status_code not in {200, 400}:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "QuickBooks disconnect request failed: "
+                f"{response.status_code} {response.text[:300]}"
+            ),
+        )
+
+    delete_qbo_connection(
+        connection["realm_id"]
     )
+
+    return {
+        "disconnected": True,
+        "realm_id": connection["realm_id"],
+    }
 
 
 @app.get("/qbo/callback", response_class=HTMLResponse)
@@ -120,23 +556,34 @@ def qbo_callback(
     error_description: str | None = None,
 ) -> HTMLResponse:
     """
-    Receives Intuit's OAuth callback, exchanges the authorization code
-    for tokens, and marks the desktop session as connected.
+    Intuit OAuth callback.
+
+    The final access/refresh tokens are encrypted and persisted in PostgreSQL,
+    so a Render restart does not disconnect the desktop application.
     """
-    if not state or state not in oauth_sessions:
+    if not state:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing OAuth state.",
+        )
+
+    existing_session = get_connect_session_by_state(
+        state
+    )
+
+    if not existing_session:
         raise HTTPException(
             status_code=400,
             detail="Invalid or expired OAuth state.",
         )
 
-    existing_session = oauth_sessions[state]
+    session_id = existing_session["session_id"]
 
     if error:
-        existing_session.update(
-            {
-                "status": "failed",
-                "message": error_description or error,
-            }
+        update_connect_session(
+            session_id,
+            status="failed",
+            message=error_description or error,
         )
 
         return HTMLResponse(
@@ -149,43 +596,43 @@ def qbo_callback(
         )
 
     if not code or not realmId:
-        existing_session.update(
-            {
-                "status": "failed",
-                "message": "Missing authorization code or company ID.",
-            }
+        update_connect_session(
+            session_id,
+            status="failed",
+            message=(
+                "Missing authorization code or company ID."
+            ),
         )
 
         raise HTTPException(
             status_code=400,
-            detail="Missing authorization code or company ID.",
+            detail=(
+                "Missing authorization code or company ID."
+            ),
         )
 
     try:
         token_data = exchange_code_for_tokens(code)
+
+        save_qbo_connection(
+            realm_id=str(realmId),
+            token_data=token_data,
+        )
+
+        update_connect_session(
+            session_id,
+            status="connected",
+            realm_id=str(realmId),
+            message=None,
+        )
+
     except HTTPException as exc:
-        existing_session.update(
-            {
-                "status": "failed",
-                "message": str(exc.detail),
-            }
+        update_connect_session(
+            session_id,
+            status="failed",
+            message=str(exc.detail),
         )
         raise
-
-    oauth_sessions[state] = {
-        "session_id": existing_session.get("session_id"),
-        "status": "connected",
-        "realm_id": realmId,
-        "access_token": token_data["access_token"],
-        "refresh_token": token_data["refresh_token"],
-        "expires_in": token_data.get("expires_in"),
-        "access_token_expires_at": (
-            time.time() + int(token_data.get("expires_in", 3600)) - 60
-        ),
-        "refresh_token_expires_in": token_data.get(
-            "x_refresh_token_expires_in"
-        ),
-    }
 
     return HTMLResponse(
         content=build_result_page(
@@ -751,52 +1198,237 @@ def unique_archive_name(filename: str, used_names: set[str]) -> str:
 
 
 def get_connected_session() -> tuple[str, dict]:
-    connected = [
-        (state, session) for state, session in oauth_sessions.items()
-        if session.get("status") == "connected"
-        and session.get("realm_id")
-        and session.get("refresh_token")
-    ]
-    if not connected:
-        raise HTTPException(status_code=401, detail="No QuickBooks company is connected.")
-    return connected[-1]
+    """
+    Compatibility wrapper used by the existing QBO endpoints.
+
+    The first tuple value is the realm_id (previously this was an in-memory
+    OAuth state key).
+    """
+    connection = load_active_qbo_connection()
+
+    if not connection:
+        raise HTTPException(
+            status_code=401,
+            detail="No QuickBooks company is connected.",
+        )
+
+    return str(connection["realm_id"]), connection
 
 
-def get_valid_access_token(state: str, session: dict) -> str:
-    if session.get("access_token") and time.time() < float(session.get("access_token_expires_at", 0)):
-        return session["access_token"]
-    return refresh_session_access_token(state, session)
+def get_valid_access_token(
+    state: str,
+    session: dict,
+) -> str:
+    """
+    Return a usable access token.
 
+    Always reload from PostgreSQL first so another request/process cannot
+    leave this request using a stale token after a refresh-token rotation.
+    """
+    current = load_active_qbo_connection()
 
-def refresh_session_access_token(state: str, session: dict) -> str:
-    refresh_token = session.get("refresh_token")
-    if not refresh_token:
-        raise HTTPException(status_code=401, detail="The QuickBooks refresh token is unavailable.")
-    credentials = f"{CLIENT_ID}:{CLIENT_SECRET}".encode("utf-8")
-    encoded_credentials = base64.b64encode(credentials).decode("ascii")
-    response = requests.post(
-        TOKEN_URL,
-        headers={
-            "Authorization": f"Basic {encoded_credentials}",
-            "Accept": "application/json",
-            "Content-Type": "application/x-www-form-urlencoded",
-        },
-        data={"grant_type": "refresh_token", "refresh_token": refresh_token},
-        timeout=30,
+    if not current:
+        raise HTTPException(
+            status_code=401,
+            detail="No QuickBooks company is connected.",
+        )
+
+    if (
+        current.get("access_token")
+        and time.time()
+        < float(
+            current.get(
+                "access_token_expires_at",
+                0,
+            )
+        )
+    ):
+        return current["access_token"]
+
+    return refresh_session_access_token(
+        str(current["realm_id"]),
+        current,
     )
-    try:
-        token_data = response.json()
-    except ValueError as exc:
-        raise HTTPException(status_code=502, detail="Intuit returned an unreadable refresh response.") from exc
-    if not response.ok:
-        description = token_data.get("error_description") or token_data.get("error") or response.reason
-        raise HTTPException(status_code=401, detail=f"QuickBooks authorization refresh failed: {description}")
-    session["access_token"] = token_data["access_token"]
-    session["refresh_token"] = token_data.get("refresh_token", refresh_token)
-    session["expires_in"] = token_data.get("expires_in", 3600)
-    session["access_token_expires_at"] = time.time() + int(token_data.get("expires_in", 3600)) - 60
-    oauth_sessions[state] = session
-    return session["access_token"]
+
+
+def refresh_session_access_token(
+    state: str,
+    session: dict,
+) -> str:
+    """
+    Refresh tokens atomically.
+
+    The PostgreSQL row is locked while refreshing. This prevents two Render
+    workers from simultaneously using the same refresh token, which Intuit
+    warns can cause invalid_grant and invalidate the connection.
+    """
+    realm_id = str(
+        session.get("realm_id")
+        or state
+    )
+
+    credentials = (
+        f"{CLIENT_ID}:{CLIENT_SECRET}"
+    ).encode("utf-8")
+    encoded_credentials = base64.b64encode(
+        credentials
+    ).decode("ascii")
+
+    with db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT *
+                FROM qbo_connections
+                WHERE realm_id = %s
+                  AND active = TRUE
+                FOR UPDATE
+                """,
+                (realm_id,),
+            )
+
+            row = cursor.fetchone()
+
+            if not row:
+                raise HTTPException(
+                    status_code=401,
+                    detail=(
+                        "The QuickBooks connection "
+                        "is no longer available."
+                    ),
+                )
+
+            current = dict(row)
+
+            # Another request may have refreshed while this request waited
+            # for the row lock.
+            if (
+                time.time()
+                < float(
+                    current.get(
+                        "access_token_expires_at",
+                        0,
+                    )
+                )
+            ):
+                return decrypt_token(
+                    current["access_token_enc"]
+                )
+
+            refresh_token = decrypt_token(
+                current["refresh_token_enc"]
+            )
+
+            try:
+                response = requests.post(
+                    TOKEN_URL,
+                    headers={
+                        "Authorization": (
+                            f"Basic {encoded_credentials}"
+                        ),
+                        "Accept": "application/json",
+                        "Content-Type": (
+                            "application/"
+                            "x-www-form-urlencoded"
+                        ),
+                    },
+                    data={
+                        "grant_type": "refresh_token",
+                        "refresh_token": refresh_token,
+                    },
+                    timeout=30,
+                )
+            except requests.RequestException as exc:
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        "Could not refresh QuickBooks "
+                        f"authorization: {exc}"
+                    ),
+                ) from exc
+
+            try:
+                token_data = response.json()
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        "Intuit returned an unreadable "
+                        "refresh response."
+                    ),
+                ) from exc
+
+            if not response.ok:
+                description = (
+                    token_data.get(
+                        "error_description"
+                    )
+                    or token_data.get("error")
+                    or response.reason
+                )
+
+                raise HTTPException(
+                    status_code=401,
+                    detail=(
+                        "QuickBooks authorization "
+                        f"refresh failed: {description}"
+                    ),
+                )
+
+            new_access_token = token_data.get(
+                "access_token"
+            )
+
+            # Intuit may rotate refresh_token. Always persist the newest
+            # value from the response, never a stale cached token.
+            new_refresh_token = token_data.get(
+                "refresh_token"
+            ) or refresh_token
+
+            if not new_access_token:
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        "Intuit refresh response did "
+                        "not contain an access token."
+                    ),
+                )
+
+            expires_in = int(
+                token_data.get("expires_in")
+                or 3600
+            )
+            now = time.time()
+
+            cursor.execute(
+                """
+                UPDATE qbo_connections
+                SET
+                    access_token_enc = %s,
+                    refresh_token_enc = %s,
+                    access_token_expires_at = %s,
+                    refresh_token_expires_in =
+                        COALESCE(%s, refresh_token_expires_in),
+                    updated_at = %s
+                WHERE realm_id = %s
+                """,
+                (
+                    encrypt_token(
+                        new_access_token
+                    ),
+                    encrypt_token(
+                        new_refresh_token
+                    ),
+                    now + expires_in - 60,
+                    token_data.get(
+                        "x_refresh_token_expires_in"
+                    ),
+                    now,
+                    realm_id,
+                ),
+            )
+
+            return new_access_token
 
 
 def build_authorization_url(state: str) -> str:

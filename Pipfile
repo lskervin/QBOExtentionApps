@@ -14,6 +14,12 @@ python-dotenv = "*"
 keyring = "*"
 requests = "*"
 xlsxwriter = "*"
+opencv-python-headless = "*"
+paddleocr = "*"
+"winrt-windows.media.ocr" = "*"
+"winrt-windows.globalization" = "*"
+"winrt-windows.storage.streams" = "*"
+"winrt-windows.graphics.imaging" = "*"
 
 [dev-packages]
 pyinstaller = "*"
