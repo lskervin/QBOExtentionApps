@@ -20,6 +20,7 @@ paddleocr = "*"
 "winrt-windows.globalization" = "*"
 "winrt-windows.storage.streams" = "*"
 "winrt-windows.graphics.imaging" = "*"
+psycopg2 = "*"
 
 [dev-packages]
 pyinstaller = "*"
