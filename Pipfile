@@ -21,6 +21,7 @@ paddleocr = "*"
 "winrt-windows.storage.streams" = "*"
 "winrt-windows.graphics.imaging" = "*"
 psycopg2 = "*"
+fastapi = "*"
 
 [dev-packages]
 pyinstaller = "*"
