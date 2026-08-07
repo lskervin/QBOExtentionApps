@@ -26,9 +26,9 @@ CLIENT_ID = os.getenv("QBO_CLIENT_ID", "").strip()
 CLIENT_SECRET = os.getenv("QBO_CLIENT_SECRET", "").strip()
 REDIRECT_URI = os.getenv(
     "QBO_REDIRECT_URI",
-    "http://localhost:8000/callback",
+    "https://qbo-extension-auth.onrender.com/qbo/callback",
 ).strip()
-ENVIRONMENT = os.getenv("QBO_ENVIRONMENT", "sandbox").strip().lower()
+ENVIRONMENT = os.getenv("QBO_ENVIRONMENT", "production").strip().lower()
 
 AUTHORIZATION_URL = "https://appcenter.intuit.com/connect/oauth2"
 TOKEN_URL = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"

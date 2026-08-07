@@ -1,10 +1,12 @@
 from __future__ import annotations
 import json
+import sqlite3
 import re
 import shutil
 import tempfile
 import zipfile
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
 import os
 import threading
@@ -19,42 +21,7 @@ from typing import Callable, Optional
 from urllib.parse import quote
 import customtkinter as ctk
 import xlsxwriter
-import sys
 
-
-def get_bundled_path(relative_path: str) -> Path:
-    """
-    Returns a path that works both during normal Python execution
-    and when packaged with PyInstaller.
-    """
-    if getattr(sys, "frozen", False):
-        base_path = Path(sys.executable).resolve().parent
-    else:
-        base_path = Path(__file__).resolve().parent
-
-    return base_path / relative_path
-
-
-def configure_tesseract() -> None:
-    if pytesseract is None:
-        return
-
-    bundled_tesseract = get_bundled_path(
-        r"tesseract\tesseract.exe"
-    )
-
-    installed_tesseract = Path(
-        r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-    )
-
-    if bundled_tesseract.exists():
-        pytesseract.pytesseract.tesseract_cmd = str(
-            bundled_tesseract
-        )
-    elif installed_tesseract.exists():
-        pytesseract.pytesseract.tesseract_cmd = str(
-            installed_tesseract
-        )
 # Optional local attachment-analysis dependencies.
 try:
     import pytesseract
@@ -100,6 +67,19 @@ def get_app_data_dir() -> Path:
 
 
 CONFIG_FILE = get_app_data_dir() / "settings.json"
+
+HTTP_SESSION = requests.Session()
+HTTP_SESSION.headers.update(
+    {
+        "User-Agent": f"{APP_NAME}/{APP_VERSION}",
+        "Accept": "application/json",
+    }
+)
+
+CACHE_ROOT = get_app_data_dir() / "cache"
+ATTACHMENT_CACHE_DIR = CACHE_ROOT / "attachments"
+ATTACHMENT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+CACHE_DB = CACHE_ROOT / "attachment_cache.sqlite3"
 
 
 @dataclass
@@ -1178,9 +1158,15 @@ class InvoiceAttachmentsPage(Page):
 
 class InvoiceLineDetailsPage(Page):
     """
-    Downloads invoice-level attachments locally, reads the filename and
-    document content, matches each file to the most likely invoice line,
-    and creates the renamed ZIP locally.
+    Optimized invoice attachment analysis:
+
+    1. Reuses one HTTP session.
+    2. Downloads attachments concurrently.
+    3. Stores attachments persistently in the local app cache.
+    4. Reuses cached OCR and embedded PDF text.
+    5. Matches by filename before doing OCR.
+    6. OCRs only files that remain unmatched.
+    7. Reuses cached files when creating the ZIP.
     """
 
     COLUMNS = ("line_number", "description", "amount", "attachment", "status")
@@ -1205,6 +1191,10 @@ class InvoiceLineDetailsPage(Page):
         ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"
     }
 
+    MAX_DOWNLOAD_WORKERS = min(4, os.cpu_count() or 2)
+    FAST_PDF_SCALE = 1.5
+    RETRY_PDF_SCALE = 2.0
+
     def __init__(self, master, app: "QBOExtensionApp"):
         super().__init__(master, app)
 
@@ -1216,6 +1206,8 @@ class InvoiceLineDetailsPage(Page):
         self.lines: list[dict] = []
         self.attachments: list[dict] = []
         self.unmatched_attachments: list[dict] = []
+
+        self._initialize_cache_database()
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(3, weight=1)
@@ -1340,7 +1332,10 @@ class InvoiceLineDetailsPage(Page):
         self.tree.bind("<<TreeviewSelect>>", self.update_attachment_button)
         self.tree.bind("<Double-1>", self.open_selected_attachment)
 
-        self.unmatched_frame = ctk.CTkFrame(self, corner_radius=12)
+        self.unmatched_frame = ctk.CTkFrame(
+            self,
+            corner_radius=12,
+        )
         self.unmatched_frame.grid(
             row=4,
             column=0,
@@ -1355,20 +1350,45 @@ class InvoiceLineDetailsPage(Page):
             text="Unmatched invoice attachments",
             font=ctk.CTkFont(weight="bold"),
             anchor="w",
-        ).grid(row=0, column=0, padx=14, pady=(10, 4), sticky="ew")
+        ).grid(
+            row=0,
+            column=0,
+            padx=14,
+            pady=(10, 4),
+            sticky="ew",
+        )
 
-        self.unmatched_links = ctk.CTkFrame(
+        self.unmatched_links = ctk.CTkScrollableFrame(
             self.unmatched_frame,
-            fg_color="transparent",
+            height=180,
+            corner_radius=8,
         )
         self.unmatched_links.grid(
             row=1,
             column=0,
             padx=14,
-            pady=(0, 10),
+            pady=(0, 12),
             sticky="ew",
         )
+
         self.unmatched_frame.grid_remove()
+
+    @staticmethod
+    def _initialize_cache_database() -> None:
+        with sqlite3.connect(CACHE_DB) as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS attachment_text_cache (
+                    attachment_id TEXT PRIMARY KEY,
+                    file_name TEXT NOT NULL,
+                    file_size INTEGER NOT NULL,
+                    embedded_text TEXT NOT NULL DEFAULT '',
+                    ocr_text TEXT NOT NULL DEFAULT '',
+                    updated_at INTEGER NOT NULL
+                )
+                """
+            )
+            connection.commit()
 
     def load_invoice(self, invoice_id: str, doc_number: str) -> None:
         self.invoice_id = str(invoice_id)
@@ -1397,7 +1417,7 @@ class InvoiceLineDetailsPage(Page):
 
     def _load_worker(self) -> None:
         try:
-            response = requests.get(
+            response = HTTP_SESSION.get(
                 f"{RENDER_AUTH_BASE_URL}/invoices/{quote(self.invoice_id, safe='')}/detail",
                 timeout=120,
             )
@@ -1414,7 +1434,6 @@ class InvoiceLineDetailsPage(Page):
             invoice = payload.get("invoice", {})
             lines = payload.get("lines", [])
 
-            # The updated backend returns all invoice-level files here.
             attachments = payload.get("attachments")
             if attachments is None:
                 attachments = list(payload.get("unmatched_attachments", []))
@@ -1444,14 +1463,8 @@ class InvoiceLineDetailsPage(Page):
         attachments: list[dict],
     ) -> None:
         self.invoice = invoice
-        self.lines = [
-            {
-                **line,
-                "attachments": [],
-            }
-            for line in lines
-        ]
-        self.attachments = attachments
+        self.lines = [{**line, "attachments": []} for line in lines]
+        self.attachments = [dict(item) for item in attachments]
 
         customer_ref = invoice.get("CustomerRef") or {}
         customer = customer_ref.get("name") or customer_ref.get("value") or ""
@@ -1464,14 +1477,16 @@ class InvoiceLineDetailsPage(Page):
             )
         )
 
+        # Show invoice lines immediately so the page feels responsive.
+        self._populate_line_table()
+
         if not attachments:
             self.loading = False
             self.status_label.configure(text="This invoice has no attachments.")
-            self._populate_line_table()
             return
 
         self.status_label.configure(
-            text=f"Analyzing {len(attachments)} attachments locally..."
+            text=f"Preparing {len(attachments)} attachments..."
         )
 
         threading.Thread(
@@ -1481,41 +1496,45 @@ class InvoiceLineDetailsPage(Page):
 
     def _analyze_attachments_worker(self) -> None:
         try:
-            with tempfile.TemporaryDirectory() as temp_dir:
-                analyzed = []
+            prepared = self._prepare_attachments_concurrently(self.attachments)
 
-                for index, attachment in enumerate(self.attachments, start=1):
-                    self.after(
-                        0,
-                        lambda current=index, total=len(self.attachments):
-                        self.status_label.configure(
-                            text=f"Analyzing attachment {current} of {total}..."
-                        ),
-                    )
+            # Stage 1: filename-only matching. No text extraction or OCR.
+            lines, filename_unmatched = self._match_pass(
+                self.lines,
+                prepared,
+                use_text=False,
+            )
 
-                    local_path = self._download_attachment(
-                        attachment,
-                        temp_dir,
-                    )
-                    extracted_text = self.extract_text(local_path)
-
-                    analyzed.append(
-                        {
-                            **attachment,
-                            "local_name": Path(local_path).name,
-                            "text": extracted_text,
-                        }
-                    )
-
-                matched_lines, unmatched = self.match_attachments(
-                    self.lines,
-                    analyzed,
+            # Stage 2: embedded PDF text and cached text only.
+            for index, attachment in enumerate(filename_unmatched, start=1):
+                self._set_status_threadsafe(
+                    f"Reading document text {index} of {len(filename_unmatched)}..."
                 )
+                attachment["text"] = self._get_embedded_or_cached_text(attachment)
+
+            lines, text_unmatched = self._match_pass(
+                lines,
+                filename_unmatched,
+                use_text=True,
+            )
+
+            # Stage 3: OCR only files that still could not be matched.
+            for index, attachment in enumerate(text_unmatched, start=1):
+                self._set_status_threadsafe(
+                    f"OCR analysis {index} of {len(text_unmatched)}..."
+                )
+                attachment["text"] = self._get_or_create_ocr_text(attachment)
+
+            lines, final_unmatched = self._match_pass(
+                lines,
+                text_unmatched,
+                use_text=True,
+            )
 
             self.after(
                 0,
-                lambda lines=matched_lines, remaining=unmatched:
-                self._analysis_succeeded(lines, remaining),
+                lambda matched=lines, remaining=final_unmatched:
+                self._analysis_succeeded(matched, remaining),
             )
 
         except Exception as exc:
@@ -1526,42 +1545,102 @@ class InvoiceLineDetailsPage(Page):
                 ),
             )
 
-    def _download_attachment(self, attachment: dict, directory: str) -> str:
-        download_url = attachment.get("download_url")
-        if not download_url:
-            attachment_id = attachment.get("id")
-            download_url = (
-                f"{RENDER_AUTH_BASE_URL}/attachments/"
-                f"{quote(str(attachment_id), safe='')}/download"
-            )
+    def _prepare_attachments_concurrently(
+        self,
+        attachments: list[dict],
+    ) -> list[dict]:
+        prepared: list[dict] = []
+        total = len(attachments)
 
+        with ThreadPoolExecutor(
+            max_workers=self.MAX_DOWNLOAD_WORKERS
+        ) as executor:
+            future_map = {
+                executor.submit(self._ensure_cached_attachment, attachment):
+                attachment
+                for attachment in attachments
+            }
+
+            completed = 0
+            for future in as_completed(future_map):
+                completed += 1
+                self._set_status_threadsafe(
+                    f"Downloading attachments {completed} of {total}..."
+                )
+
+                attachment = dict(future_map[future])
+                local_path = future.result()
+                attachment["cached_path"] = str(local_path)
+                attachment["file_size"] = local_path.stat().st_size
+                attachment["text"] = ""
+                prepared.append(attachment)
+
+        # Preserve QBO's original attachment order.
+        order = {
+            str(item.get("id")): index
+            for index, item in enumerate(attachments)
+        }
+        prepared.sort(key=lambda item: order.get(str(item.get("id")), 999999))
+        return prepared
+
+    def _ensure_cached_attachment(self, attachment: dict) -> Path:
+        attachment_id = str(attachment.get("id") or "").strip()
         filename = self.sanitize_filename(
             attachment.get("file_name")
-            or f"attachment_{attachment.get('id', '')}"
+            or f"attachment_{attachment_id}"
         )
-        output_path = self.unique_path(Path(directory), filename)
 
-        response = requests.get(download_url, stream=True, timeout=180)
+        invoice_cache = ATTACHMENT_CACHE_DIR / self.invoice_id
+        invoice_cache.mkdir(parents=True, exist_ok=True)
+
+        cache_name = self.sanitize_filename(
+            f"{attachment_id}_{filename}"
+        )
+        cache_path = invoice_cache / cache_name
+
+        if cache_path.exists() and cache_path.stat().st_size > 0:
+            return cache_path
+
+        download_url = attachment.get("download_url")
+        if not download_url:
+            download_url = (
+                f"{RENDER_AUTH_BASE_URL}/attachments/"
+                f"{quote(attachment_id, safe='')}/download"
+            )
+
+        temporary_path = cache_path.with_suffix(cache_path.suffix + ".part")
+
+        response = HTTP_SESSION.get(
+            download_url,
+            stream=True,
+            timeout=180,
+        )
         response.raise_for_status()
 
-        with open(output_path, "wb") as output_file:
+        with open(temporary_path, "wb") as output_file:
             for chunk in response.iter_content(1024 * 256):
                 if chunk:
                     output_file.write(chunk)
 
-        return str(output_path)
+        temporary_path.replace(cache_path)
+        return cache_path
 
-    def match_attachments(
+    def _match_pass(
         self,
         lines: list[dict],
         attachments: list[dict],
+        use_text: bool,
     ) -> tuple[list[dict], list[dict]]:
-        remaining_indexes = list(range(len(lines)))
+        remaining_indexes = [
+            index
+            for index, line in enumerate(lines)
+            if not line.get("attachments")
+        ]
         unmatched = []
 
         for attachment in attachments:
             filename = attachment.get("file_name", "")
-            text = attachment.get("text", "")
+            text = attachment.get("text", "") if use_text else ""
             likely_amounts = self.extract_likely_amounts(filename, text)
             candidates = []
 
@@ -1582,11 +1661,20 @@ class InvoiceLineDetailsPage(Page):
                 second_score = candidates[1][0] if len(candidates) > 1 else 0
                 gap = best_score - second_score
 
-                if (
-                    best_score >= 105
-                    or (best_score >= 85 and gap >= 15)
-                    or (best_score >= 65 and gap >= 30)
-                ):
+                if use_text:
+                    accepted = (
+                        best_score >= 105
+                        or (best_score >= 85 and gap >= 15)
+                        or (best_score >= 65 and gap >= 30)
+                    )
+                else:
+                    # Filename-only stage should be conservative.
+                    accepted = (
+                        best_score >= 125
+                        or (best_score >= 110 and gap >= 20)
+                    )
+
+                if accepted:
                     lines[best_index]["attachments"].append(attachment)
                     remaining_indexes.remove(best_index)
                     continue
@@ -1594,6 +1682,101 @@ class InvoiceLineDetailsPage(Page):
             unmatched.append(attachment)
 
         return lines, unmatched
+
+    def _get_embedded_or_cached_text(self, attachment: dict) -> str:
+        cached = self._read_text_cache(attachment)
+        if cached and cached.get("embedded_text"):
+            return cached["embedded_text"]
+
+        path = attachment.get("cached_path", "")
+        embedded_text = self.extract_embedded_text(path)
+
+        self._write_text_cache(
+            attachment,
+            embedded_text=embedded_text,
+            ocr_text=(cached or {}).get("ocr_text", ""),
+        )
+        return embedded_text
+
+    def _get_or_create_ocr_text(self, attachment: dict) -> str:
+        cached = self._read_text_cache(attachment)
+        if cached and cached.get("ocr_text"):
+            return cached["ocr_text"]
+
+        path = attachment.get("cached_path", "")
+        embedded_text = (cached or {}).get("embedded_text", "")
+        ocr_text = self.extract_ocr_text(path)
+
+        self._write_text_cache(
+            attachment,
+            embedded_text=embedded_text,
+            ocr_text=ocr_text,
+        )
+        return ocr_text or embedded_text
+
+    @staticmethod
+    def _read_text_cache(attachment: dict) -> dict | None:
+        attachment_id = str(attachment.get("id") or "")
+        file_name = str(attachment.get("file_name") or "")
+        file_size = int(attachment.get("file_size") or 0)
+
+        with sqlite3.connect(CACHE_DB) as connection:
+            row = connection.execute(
+                """
+                SELECT file_name, file_size, embedded_text, ocr_text
+                FROM attachment_text_cache
+                WHERE attachment_id = ?
+                """,
+                (attachment_id,),
+            ).fetchone()
+
+        if not row:
+            return None
+
+        cached_name, cached_size, embedded_text, ocr_text = row
+        if cached_name != file_name or int(cached_size) != file_size:
+            return None
+
+        return {
+            "embedded_text": embedded_text or "",
+            "ocr_text": ocr_text or "",
+        }
+
+    @staticmethod
+    def _write_text_cache(
+        attachment: dict,
+        embedded_text: str,
+        ocr_text: str,
+    ) -> None:
+        with sqlite3.connect(CACHE_DB) as connection:
+            connection.execute(
+                """
+                INSERT INTO attachment_text_cache (
+                    attachment_id,
+                    file_name,
+                    file_size,
+                    embedded_text,
+                    ocr_text,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(attachment_id) DO UPDATE SET
+                    file_name = excluded.file_name,
+                    file_size = excluded.file_size,
+                    embedded_text = excluded.embedded_text,
+                    ocr_text = excluded.ocr_text,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    str(attachment.get("id") or ""),
+                    str(attachment.get("file_name") or ""),
+                    int(attachment.get("file_size") or 0),
+                    embedded_text or "",
+                    ocr_text or "",
+                    int(time.time()),
+                ),
+            )
+            connection.commit()
 
     def score_match(
         self,
@@ -1640,14 +1823,15 @@ class InvoiceLineDetailsPage(Page):
             * 35
         )
 
-        score += (
-            SequenceMatcher(
-                None,
-                self.normalize(text[:3000]),
-                normalized_description,
-            ).ratio()
-            * 25
-        )
+        if text:
+            score += (
+                SequenceMatcher(
+                    None,
+                    self.normalize(text[:3000]),
+                    normalized_description,
+                ).ratio()
+                * 25
+            )
 
         return score
 
@@ -1656,12 +1840,12 @@ class InvoiceLineDetailsPage(Page):
         combined = f"{filename}\n{text}".replace(",", "")
         values = []
 
-        priority_patterns = [
+        patterns = [
             r"(?i)(?:grand total|amount paid|total paid|total charged|total|charged|payment)\D{0,50}\$?\s*(-?\d+\.\d{2})",
             r"(?<!\d)(-?\d+\.\d{2})(?!\d)",
         ]
 
-        for pattern in priority_patterns:
+        for pattern in patterns:
             for match in re.finditer(pattern, combined):
                 try:
                     values.append(round(float(match.group(1)), 2))
@@ -1670,55 +1854,93 @@ class InvoiceLineDetailsPage(Page):
 
         return list(dict.fromkeys(values))
 
-    def extract_text(self, path: str) -> str:
-        extension = Path(path).suffix.lower()
+    def extract_embedded_text(self, path: str) -> str:
+        file_path = Path(path)
+        if file_path.suffix.lower() != ".pdf" or pdfplumber is None:
+            return ""
+
+        try:
+            with pdfplumber.open(file_path) as pdf:
+                # First page usually contains enough receipt information.
+                first_page_text = pdf.pages[0].extract_text() or ""
+                if len(first_page_text.strip()) >= 20:
+                    return first_page_text
+
+                return "\n".join(
+                    page.extract_text() or ""
+                    for page in pdf.pages
+                )
+        except Exception:
+            return ""
+
+    def extract_ocr_text(self, path: str) -> str:
+        file_path = Path(path)
+        extension = file_path.suffix.lower()
 
         if extension in self.IMAGE_EXTENSIONS:
-            return self.extract_image_text(path)
+            return self.extract_image_text(str(file_path))
 
-        if extension == ".pdf":
-            text = ""
+        if (
+            extension != ".pdf"
+            or fitz is None
+            or Image is None
+            or pytesseract is None
+        ):
+            return ""
 
-            if pdfplumber is not None:
-                try:
-                    with pdfplumber.open(path) as pdf:
-                        text = "\n".join(
-                            page.extract_text() or ""
-                            for page in pdf.pages
-                        )
-                except Exception:
-                    text = ""
+        try:
+            document = fitz.open(file_path)
+            if len(document) == 0:
+                return ""
 
-            if text.strip():
-                return text
+            # OCR the first page at a lower scale first.
+            first_text = self._ocr_pdf_page(
+                document[0],
+                self.FAST_PDF_SCALE,
+            )
 
-            if fitz is not None and Image is not None and pytesseract is not None:
-                try:
-                    document = fitz.open(path)
-                    output = []
+            if len(first_text.strip()) >= 20:
+                return first_text
 
-                    for page in document:
-                        pixmap = page.get_pixmap(
-                            matrix=fitz.Matrix(2, 2),
-                            alpha=False,
-                        )
-                        image = Image.frombytes(
-                            "RGB",
-                            [pixmap.width, pixmap.height],
-                            pixmap.samples,
-                        )
-                        output.append(
-                            pytesseract.image_to_string(
-                                image,
-                                config="--oem 3 --psm 6",
-                            )
-                        )
+            # Retry the first page at higher resolution.
+            first_text = self._ocr_pdf_page(
+                document[0],
+                self.RETRY_PDF_SCALE,
+            )
+            if len(first_text.strip()) >= 20:
+                return first_text
 
-                    return "\n".join(output)
-                except Exception:
-                    return ""
+            # Only process remaining pages when the first page is insufficient.
+            output = [first_text]
+            for page_index in range(1, len(document)):
+                output.append(
+                    self._ocr_pdf_page(
+                        document[page_index],
+                        self.FAST_PDF_SCALE,
+                    )
+                )
 
-        return ""
+            return "\n".join(output)
+
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _ocr_pdf_page(page, scale: float) -> str:
+        pixmap = page.get_pixmap(
+            matrix=fitz.Matrix(scale, scale),
+            alpha=False,
+        )
+        image = Image.frombytes(
+            "RGB",
+            [pixmap.width, pixmap.height],
+            pixmap.samples,
+        )
+
+        return pytesseract.image_to_string(
+            image,
+            config="--oem 3 --psm 6",
+        )
 
     @staticmethod
     def extract_image_text(path: str) -> str:
@@ -1729,6 +1951,18 @@ class InvoiceLineDetailsPage(Page):
             image = Image.open(path)
             if image.mode not in {"RGB", "L"}:
                 image = image.convert("RGB")
+
+            # Large phone screenshots can be downsized substantially.
+            max_dimension = max(image.size)
+            if max_dimension > 2400:
+                ratio = 2400 / max_dimension
+                image = image.resize(
+                    (
+                        max(1, int(image.width * ratio)),
+                        max(1, int(image.height * ratio)),
+                    ),
+                    Image.Resampling.LANCZOS,
+                )
 
             return pytesseract.image_to_string(
                 image,
@@ -1745,6 +1979,12 @@ class InvoiceLineDetailsPage(Page):
         self.loading = False
         self.lines = lines
         self.unmatched_attachments = unmatched
+        self.attachments = [
+            attachment
+            for line in lines
+            for attachment in line.get("attachments", [])
+        ] + unmatched
+
         self._populate_line_table()
 
         matched_count = sum(
@@ -1759,7 +1999,7 @@ class InvoiceLineDetailsPage(Page):
                 f"{len(unmatched)} unmatched"
             )
         )
-        self.status_label.configure(text="Local attachment analysis complete.")
+        self.status_label.configure(text="Attachment analysis complete.")
         self.export_zip_button.configure(
             state="normal" if self.attachments else "disabled"
         )
@@ -1871,6 +2111,14 @@ class InvoiceLineDetailsPage(Page):
 
     @staticmethod
     def _open_attachment(attachment: dict) -> None:
+        cached_path = attachment.get("cached_path")
+        if cached_path and Path(cached_path).exists():
+            try:
+                os.startfile(cached_path)
+                return
+            except OSError:
+                pass
+
         open_url = attachment.get("open_url")
         if not open_url:
             messagebox.showerror(
@@ -1882,7 +2130,7 @@ class InvoiceLineDetailsPage(Page):
         if not webbrowser.open(open_url):
             messagebox.showerror(
                 "Could not open attachment",
-                "The attachment could not be opened in your browser.",
+                "The attachment could not be opened.",
             )
 
     def export_all_attachments_zip(self) -> None:
@@ -1901,7 +2149,7 @@ class InvoiceLineDetailsPage(Page):
 
         self.export_zip_button.configure(text="Building ZIP...", state="disabled")
         self.status_label.configure(
-            text="Downloading, renaming, and packaging attachments..."
+            text="Renaming and packaging cached attachments..."
         )
 
         threading.Thread(
@@ -1918,85 +2166,85 @@ class InvoiceLineDetailsPage(Page):
                 for attachment in line.get("attachments", []):
                     attachment_to_line[str(attachment.get("id"))] = line
 
-            with tempfile.TemporaryDirectory() as temp_dir:
-                prepared_files = []
+            prepared_files = []
 
-                for attachment in self.attachments:
-                    local_path = self._download_attachment(
-                        attachment,
-                        temp_dir,
+            for attachment in self.attachments:
+                cached_path = Path(
+                    attachment.get("cached_path")
+                    or self._ensure_cached_attachment(attachment)
+                )
+
+                local_path = cached_path
+                matched_line = attachment_to_line.get(
+                    str(attachment.get("id"))
+                )
+                extension = local_path.suffix.lower()
+
+                if extension in self.IMAGE_EXTENSIONS:
+                    converted_path = self.convert_image_to_pdf(str(local_path))
+                    if converted_path:
+                        local_path = Path(converted_path)
+                        extension = ".pdf"
+
+                if matched_line:
+                    new_name = self.sanitize_filename(
+                        (
+                            f"{matched_line.get('line_number')} - "
+                            f"${float(matched_line.get('amount') or 0):.2f} - "
+                            f"{matched_line.get('description', '')}"
+                            f"{extension}"
+                        )
                     )
-                    matched_line = attachment_to_line.get(
-                        str(attachment.get("id"))
+                else:
+                    new_name = self.sanitize_filename(
+                        f"REVIEW - {attachment.get('file_name', local_path.name)}"
                     )
+                    if not Path(new_name).suffix:
+                        new_name += extension
 
-                    extension = Path(local_path).suffix.lower()
+                prepared_files.append((local_path, new_name))
 
-                    if extension in self.IMAGE_EXTENSIONS:
-                        converted_path = self.convert_image_to_pdf(local_path)
-                        if converted_path:
-                            local_path = converted_path
-                            extension = ".pdf"
+            missing_lines = [
+                line for line in self.lines
+                if not line.get("attachments")
+            ]
 
-                    if matched_line:
-                        new_name = self.sanitize_filename(
+            with zipfile.ZipFile(
+                output_path,
+                "w",
+                compression=zipfile.ZIP_DEFLATED,
+            ) as archive:
+                used_names = set()
+
+                for local_path, desired_name in prepared_files:
+                    archive_name = self.unique_archive_name(
+                        desired_name,
+                        used_names,
+                    )
+                    archive.write(local_path, archive_name)
+
+                if missing_lines:
+                    report = [
+                        f"Invoice {self.doc_number} - Missing Attachments",
+                        "=" * 65,
+                        "",
+                    ]
+
+                    for line in missing_lines:
+                        report.append(
                             (
-                                f"{matched_line.get('line_number')} - "
-                                f"${float(matched_line.get('amount') or 0):.2f} - "
-                                f"{matched_line.get('description', '')}"
-                                f"{extension}"
+                                f"Line {line.get('line_number')} | "
+                                f"${float(line.get('amount') or 0):.2f} | "
+                                f"{line.get('description', '')}"
                             )
                         )
-                    else:
-                        new_name = self.sanitize_filename(
-                            f"REVIEW - {attachment.get('file_name', Path(local_path).name)}"
-                        )
-                        if not Path(new_name).suffix:
-                            new_name += extension
 
-                    prepared_files.append((local_path, new_name))
-
-                missing_lines = [
-                    line for line in self.lines
-                    if not line.get("attachments")
-                ]
-
-                with zipfile.ZipFile(
-                    output_path,
-                    "w",
-                    compression=zipfile.ZIP_DEFLATED,
-                ) as archive:
-                    used_names = set()
-
-                    for local_path, desired_name in prepared_files:
-                        archive_name = self.unique_archive_name(
-                            desired_name,
-                            used_names,
-                        )
-                        archive.write(local_path, archive_name)
-
-                    if missing_lines:
-                        report = [
-                            f"Invoice {self.doc_number} - Missing Attachments",
-                            "=" * 65,
-                            "",
-                        ]
-
-                        for line in missing_lines:
-                            report.append(
-                                (
-                                    f"Line {line.get('line_number')} | "
-                                    f"${float(line.get('amount') or 0):.2f} | "
-                                    f"{line.get('description', '')}"
-                                )
-                            )
-
-                        archive.writestr(
-                            self.sanitize_filename(
-                                f"{self.doc_number} - Missing Attachments.txt"
-                            ),
-                            "\n".join(report),
-                        )
+                    archive.writestr(
+                        self.sanitize_filename(
+                            f"{self.doc_number} - Missing Attachments.txt"
+                        ),
+                        "\n".join(report),
+                    )
 
             self.after(
                 0,
@@ -2025,7 +2273,12 @@ class InvoiceLineDetailsPage(Page):
 
                 frames.append(frame)
 
-            pdf_path = str(Path(image_path).with_suffix(".pdf"))
+            source = Path(image_path)
+            pdf_path = source.with_name(source.stem + "_converted.pdf")
+
+            # Reuse an existing conversion.
+            if pdf_path.exists() and pdf_path.stat().st_size > 0:
+                return str(pdf_path)
 
             if len(frames) > 1:
                 frames[0].save(
@@ -2042,7 +2295,7 @@ class InvoiceLineDetailsPage(Page):
                     resolution=100.0,
                 )
 
-            return pdf_path
+            return str(pdf_path)
         except Exception:
             return None
 
@@ -2058,6 +2311,12 @@ class InvoiceLineDetailsPage(Page):
         self.export_zip_button.configure(text="Export All as ZIP", state="normal")
         self.status_label.configure(text="Could not export the attachment ZIP.")
         messagebox.showerror("ZIP export unsuccessful", message)
+
+    def _set_status_threadsafe(self, text: str) -> None:
+        self.after(
+            0,
+            lambda value=text: self.status_label.configure(text=value),
+        )
 
     @staticmethod
     def normalize(value: str) -> str:
@@ -2077,19 +2336,6 @@ class InvoiceLineDetailsPage(Page):
             str(value or "").strip(),
         )
         return cleaned.rstrip(". ").strip() or "attachment"
-
-    @staticmethod
-    def unique_path(directory: Path, filename: str) -> Path:
-        candidate = directory / filename
-        stem = candidate.stem
-        suffix = candidate.suffix
-        counter = 2
-
-        while candidate.exists():
-            candidate = directory / f"{stem} ({counter}){suffix}"
-            counter += 1
-
-        return candidate
 
     @staticmethod
     def unique_archive_name(filename: str, used_names: set[str]) -> str:
@@ -2594,7 +2840,5 @@ class QBOExtensionApp(ctk.CTk):
 
 
 if __name__ == "__main__":
-    configure_tesseract()
-
     app = QBOExtensionApp()
     app.mainloop()
